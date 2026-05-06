@@ -2,7 +2,7 @@
 
 ## North Star
 
-Win the AMD hackathon (AI Agents + Fine-Tuning track) by demonstrating a **real, reproducible 2×+ throughput improvement on Llama-3-8B LoRA on MI300X**, driven end-to-end by a tool-using agent.
+Win the AMD hackathon (**Track 1: AI Agents & Agentic Workflows**) by demonstrating a **real, reproducible 2×+ throughput improvement on a Qwen2.5-7B LoRA fine-tune on MI300X**, driven end-to-end by a Qwen-powered tool-using agent. Hits the Qwen Technology Partner challenge with end-to-end Qwen-on-AMD; deploys as a Hugging Face Space within the hackathon HF Organization.
 
 Everything else is in service of that demo.
 
@@ -31,14 +31,14 @@ Everything else is in service of that demo.
 ## Team Roles (3 people × 4 days)
 
 ### ROCm / ML Lead
-- Day 1: MI300X cloud env, ROCm container, baseline workload (Llama-3-8B LoRA on alpaca)
+- Day 1: MI300X cloud env, ROCm container, baseline workload (Qwen2.5-7B LoRA on alpaca)
 - Day 1-2: Hand-curate 20-25 KB rules from ROCm docs + AMD blog
 - Day 2: `profile_run` + `benchmark` tools (rocprofv3 wrapper, parser)
 - Day 3: Validate end-to-end speedup on canonical demo, generate cached results
 - **Owns:** anything that touches the GPU
 
 ### Agent / Backend Lead
-- Day 1: FastAPI skeleton, tool schemas, Claude tool-use plumbing
+- Day 1: FastAPI skeleton, tool schemas, Qwen-via-HF tool-use plumbing
 - Day 1-2: `parse_config`, `propose_patch`, `query_rocm_kb`, `compare_runs` tools
 - Day 2: Full agent loop, system prompt, SSE streaming
 - Day 3: Hardening, error handling, max-steps cap, fallback behaviors
@@ -60,7 +60,7 @@ Roles overlap on integration days — pair-program when blocked.
 **ROCm Lead**
 - [ ] Provision MI300X cloud instance via AMD Developer Cloud ($100 credits), SSH access, persistent storage
 - [ ] Pull `rocm/pytorch:rocm6.1_*` image, verify GPU visible inside container
-- [ ] Run baseline `train_llama3_lora.py` (batch=4, fp16, naive attention, alpaca, 100 steps)
+- [ ] Run baseline `train_qwen_lora.py` (batch=4, fp16, naive attention, alpaca, 100 steps)
 - [ ] Capture baseline tokens/sec, MFU, HBM peak — *this is our "before"*
 - [ ] Generate **synthetic corpus** — 5-8 misconfigured variants of the canonical workload (FP32, num_workers=0, naive attention, etc.) with cached `RunMetrics` JSON for each
 - [ ] Start drafting KB rules (target 10 rules by EOD), each tagged with `targets_bucket` matching the waste-budget decomposition
@@ -72,7 +72,7 @@ Roles overlap on integration days — pair-program when blocked.
 - [ ] Define `RunnerProtocol` interface; build `FakeRunner` that loads cached metrics from `workloads/synthetic/` (lets backend dev without MI300X)
 - [ ] FastAPI `POST /audit` skeleton with SSE
 - [ ] `parse_config` tool — handle HF `TrainingArguments` first; include regex redaction pass for tokens/paths
-- [ ] Claude tool-use hello-world (one tool, one round-trip)
+- [ ] Qwen tool-use hello-world (one tool, one round-trip via HF Inference Providers)
 
 **Frontend Lead**
 - [ ] Streamlit skeleton with file upload + chat panel
@@ -84,7 +84,7 @@ Roles overlap on integration days — pair-program when blocked.
 - Synthetic corpus has ≥ 3 cached scenarios (Backend Lead can now dev without GPU)
 - Schemas (`RunMetrics`, `WasteBudget`, etc.) frozen
 - `RunnerProtocol` + `FakeRunner` working end-to-end
-- Backend can call Claude with one tool
+- Backend can call Qwen with one tool via HF Inference Providers
 - UI renders a fake audit
 - 10 KB rules drafted
 
@@ -118,7 +118,7 @@ Roles overlap on integration days — pair-program when blocked.
 ### Day 3 (May 7–8) — Demo Day Prep
 
 **All hands**
-- [ ] Run canonical demo (Llama-3-8B LoRA) end-to-end → confirm ≥ 2× speedup
+- [ ] Run canonical demo (Qwen2.5-7B LoRA) end-to-end → confirm ≥ 2× speedup
 - [ ] Cache the demo benchmark results — don't burn cloud time on every rehearsal
 - [ ] Build "golden run" replay mode (read cached SSE events, replay timing)
 - [ ] Validate uplift accuracy on synthetic corpus: predicted range should bracket measured speedup on ≥ 8 of 10 scenarios
@@ -146,7 +146,7 @@ Roles overlap on integration days — pair-program when blocked.
 - [ ] vLLM inference workload as second demo (only if rock-solid on Day 3)
 - [ ] Cost calculator: `$ saved per training run` line, anchored on $1.99/hr public MI300X reference
 - [ ] What-if slider panel for batch / precision / attention (chat already does this conversationally, sliders are visual icing)
-- [ ] Stretch dream: self-host Llama-3-70B on MI300X powering the agent itself — strongest possible AMD story, mention in pitch even if not running live
+- [ ] Stretch dream: self-host Qwen on MI300X via vLLM (replacing the HF-Inference-Providers path) — closes the loop entirely on AMD silicon. Mention in pitch even if not running live.
 
 **Day 4 Exit Criteria**
 - Submission complete by deadline
@@ -180,16 +180,16 @@ If we're behind schedule, **cut in this order**:
 | Agent loops infinitely | Low | Medium | Hard cap of 8 tool calls, fall back to "best effort" report after cap |
 | Recommendations are generic, not ROCm-specific | Medium | Critical | Hand-curate KB on Day 1 *before* wiring agent — KB is the moat |
 | Demo crashes during pitch | Low | Critical | Pre-recorded video backup. Golden-run replay mode. USB + cloud + phone copies |
-| Llama-3-8B doesn't fit a 12-batch on MI300X | Low | Medium | Have a fallback config in hand (batch=8 + grad_accum=2) |
+| Qwen2.5-7B doesn't fit a 12-batch on MI300X | Low | Medium | Have a fallback config in hand (batch=8 + grad_accum=2) |
 | LoRA on alpaca too easy — speedup looks staged | Low | High | Measure on a non-trivial seq_len (1024+), include MFU not just tokens/sec, show kernel breakdown to prove it's real |
-| Anthropic API rate limit during demo | Low | Medium | Pre-cache a recorded session for replay; have a backup API key |
+| HF Inference Provider rate limit / outage during demo | Low | Medium | Offline-replay UI lane plays cached_audit.json without any backend; pre-cache a full recorded session; have a backup HF token; `provider="auto"` already routes around individual provider outages |
 | Team member unavailable (illness, etc.) | Low | High | Pair on critical path (agent loop, KB) so no single point of failure |
 
 ## Definition of Done — MVP
 
 GPU Goblin is "done enough to ship" when **all** of these are true:
 
-- ✅ A judge can upload `train_llama3_lora.py` (we provide it) and get a real audit
+- ✅ A judge can upload `train_qwen_lora.py` (we provide it) and get a real audit
 - ✅ Agent makes ≥ 4 visible tool calls
 - ✅ Final report shows ≥ 2× tokens/sec, real numbers from MI300X
 - ✅ Every recommendation in the report cites a ROCm KB rule by ID
@@ -202,7 +202,7 @@ GPU Goblin is "done enough to ship" when **all** of these are true:
 
 - 🎯 Second canonical workload (vLLM inference) audited end-to-end
 - 🎯 Cost calculator: "you save $X per training run, $Y per epoch"
-- 🎯 Agent backed by self-hosted Llama-3-70B on the same MI300X (the ultimate AMD story — even if just shown as a screenshot in the pitch)
+- 🎯 Agent backed by self-hosted Qwen via vLLM on the same MI300X (the ultimate AMD story — replaces today's HF Inference Providers path with on-cluster serving)
 
 ## Compute Budget — AMD Developer Cloud Credits
 

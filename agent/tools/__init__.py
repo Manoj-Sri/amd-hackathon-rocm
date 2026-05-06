@@ -1,7 +1,7 @@
 """Tool registry for the GPU Goblin agent loop.
 
 Each tool file exports a `Tool` instance. The registry collects them so
-`agent/loop.py` can pass `claude_tool_schemas()` to the Anthropic API and
+`agent/loop.py` can pass `tool_schemas()` to the Anthropic API and
 dispatch tool calls by name without hardcoded imports.
 
 Phase 2 agents replacing tool implementations should NOT touch this file —
@@ -47,7 +47,7 @@ ALL_TOOLS: list[Tool] = [
 TOOL_BY_NAME: dict[str, Tool] = {t.name: t for t in ALL_TOOLS}
 
 
-def claude_tool_schemas() -> list[dict[str, Any]]:
+def tool_schemas() -> list[dict[str, Any]]:
     """Schemas in the shape Claude's tool-use API expects."""
     return [
         {"name": t.name, "description": t.description, "input_schema": t.input_schema}

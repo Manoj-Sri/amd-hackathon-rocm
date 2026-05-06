@@ -1,8 +1,8 @@
 # GPU Goblin canonical demo workload.
 #
-# Llama-3-8B + LoRA fine-tune on the alpaca-cleaned dataset, staged with
-# *deliberately* sub-optimal defaults so the goblin has something to fix in
-# the demo. This script does NOT need to actually execute on a host — it
+# Qwen2.5-7B-Instruct + LoRA fine-tune on the alpaca-cleaned dataset, staged
+# with *deliberately* sub-optimal defaults so the goblin has something to fix
+# in the demo. This script does NOT need to actually execute on a host — it
 # exists so `parse_config` can extract a realistic WorkloadConfig from it.
 #
 # Expected findings when audited:
@@ -32,7 +32,7 @@ HF_TOKEN = os.environ["HF_TOKEN"]
 os.environ["HSA_FORCE_FINE_GRAIN_PCIE"] = "1"
 os.environ["MIOPEN_FIND_MODE"] = "3"
 
-MODEL_ID = "meta-llama/Meta-Llama-3-8B"
+MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, token=HF_TOKEN)
 model = AutoModelForCausalLM.from_pretrained(

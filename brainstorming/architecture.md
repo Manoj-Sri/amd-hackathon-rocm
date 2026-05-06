@@ -11,7 +11,7 @@
                              ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │              Goblin Agent — FastAPI (port 8000)                  │
-│      Claude Sonnet 4.6 (tool use) · agent loop · session state   │
+│   Qwen2.5-7B (HF Inference Providers) · agent loop · session    │
 └─┬────────┬─────────┬──────────┬──────────┬──────────┬────────────┘
   │        │         │          │          │          │
   ▼        ▼         ▼          ▼          ▼          ▼
@@ -43,7 +43,7 @@
 - Single endpoint: `POST /audit` — takes uploaded script, returns SSE stream of agent steps
 - Session state in-memory only (hackathon, not production)
 - Hard cap: **max 8 tool calls per audit** (prevents loops)
-- LLM: **Claude Sonnet 4.6** via Anthropic SDK with tool use
+- LLM: **Qwen2.5-7B-Instruct** via Hugging Face Inference Providers (`huggingface_hub.AsyncInferenceClient.chat_completion`, OpenAI-shape tool calls). Pluggable via `agent/backends/`; a future `LiveQwenBackend` swaps to a self-hosted vLLM-on-MI300X endpoint with no other code changes.
 - System prompt establishes ROCm expert persona + tool-call etiquette + report format
 
 ### 3. The Six Tools
@@ -202,7 +202,7 @@ Post-processing (`profile_parser.py`):
 
 ### 7. Synthetic Corpus (`workloads/synthetic/`)
 
-A directory of pre-generated, deliberately misconfigured fine-tuning runs. Each entry is `{config.py, expected_findings.yaml, cached_metrics.json}`. Generated on Day 1 by ROCm Lead by perturbing the canonical Llama-3-8B LoRA workload along single dimensions: `num_workers=0`, FP32 instead of BF16, naive attention, `torch.compile=False`, untuned hipBLASLt, etc.
+A directory of pre-generated, deliberately misconfigured fine-tuning runs. Each entry is `{config.py, expected_findings.yaml, cached_metrics.json}`. Generated on Day 1 by ROCm Lead by perturbing the canonical Qwen2.5-7B LoRA workload along single dimensions: `num_workers=0`, FP32 instead of BF16, naive attention, `torch.compile=False`, untuned hipBLASLt, etc.
 
 Two purposes:
 1. **Backend Lead can develop on a laptop** — test the agent loop, KB queries, and patch generation against `cached_metrics.json` without touching the GPU.
@@ -264,13 +264,13 @@ benchmark(original) ◄──── cache ─────► benchmark(patched)
 
 | Layer | Choice | Why |
 |---|---|---|
-| Agent LLM | Claude Sonnet 4.6 (Anthropic API) | Tool use, fast, cheap, 200K context |
+| Agent LLM | Qwen2.5-7B-Instruct via HF Inference Providers | Tool calling via OpenAI-compatible API; routes through Together / Fireworks-AI / Nebius (auto). Stretch: self-host on MI300X via vLLM. |
 | Backend | Python 3.11 + FastAPI + anthropic SDK | Standard, async-friendly |
 | Frontend | Streamlit | Ships in hours, not days |
 | Container | `rocm/pytorch:rocm6.1_ubuntu22.04_py3.10_pytorch_2.3` | Official AMD image |
 | Profiling | torch.profiler + rocprofv3 + amd-smi | Native ROCm tools |
 | KB index | sentence-transformers + numpy cosine | No vector DB needed for 25 rules |
-| Workload | Llama-3-8B + LoRA + alpaca-cleaned | Canonical, reproducible |
+| Workload | Qwen2.5-7B + LoRA + alpaca-cleaned | Canonical, reproducible |
 | Hardware | MI300X cloud (single GPU, 192 GB HBM) | Hackathon constraint |
 
 ## Repo Layout
@@ -297,7 +297,7 @@ amd-hackathon/
 ├── ui/
 │   └── app.py              # Streamlit
 ├── workloads/
-│   ├── train_llama3_lora.py  # canonical demo workload
+│   ├── train_qwen_lora.py    # canonical demo workload
 │   └── synthetic/            # pre-generated misconfigured runs + cached metrics
 │       ├── 01_no_workers/
 │       ├── 02_fp32_default/
@@ -310,25 +310,32 @@ amd-hackathon/
 
 ## Agent Loop — Pseudocode
 
+The loop is provider-agnostic. It talks to a `Backend` (see `agent/backends/`); today's only concrete is `QwenHFBackend`.
+
 ```python
 def run_audit(user_script_path: str) -> SSEStream:
-    messages = [system_prompt(), user_message(user_script_path)]
+    backend = make_backend(system_prompt=SYSTEM_PROMPT)  # QwenHFBackend
+    backend.add_user_message(f"Audit this fine-tuning workload: {user_script_path}")
+
     for step in range(MAX_STEPS):  # MAX_STEPS = 8
-        response = claude.messages.create(
-            model="claude-sonnet-4-6",
-            tools=TOOL_SCHEMAS,
-            messages=messages,
-        )
-        yield {"type": "thought", "text": response.content}
-        if response.stop_reason == "end_turn":
+        turn = await backend.next_turn(tool_schemas())
+        for text in turn.text_blocks:
+            yield {"type": "thought", "text": text}
+        for tc in turn.tool_calls:
+            yield {"type": "tool_call", "name": tc.name, "input": tc.input}
+            result = call_tool(tc.name, **tc.input)
+            yield {"type": "tool_result", "name": tc.name, "result": result}
+            backend.add_tool_result(tc.id, tc.name, result.content, is_error=not result.ok)
+        if turn.stop_reason == "end_turn":
             break
-        for tool_use in response.tool_uses:
-            yield {"type": "tool_call", "name": tool_use.name, "input": tool_use.input}
-            result = TOOLS[tool_use.name](**tool_use.input)
-            yield {"type": "tool_result", "name": tool_use.name, "result": result}
-            messages.append(tool_result_message(tool_use, result))
-    yield {"type": "final_report", "report": extract_final_report(messages)}
+
+    yield {"type": "final_report", "report": extract_final_report(tool_results)}
 ```
+
+The Backend protocol (`agent/backends/base.py`) is a 3-method contract:
+`add_user_message`, `next_turn`, `add_tool_result`. `QwenHFBackend` translates
+between this neutral shape and OpenAI-compatible chat-completion calls
+through HF Inference Providers.
 
 ## Boundaries & Interfaces
 

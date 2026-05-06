@@ -38,7 +38,7 @@ from agent.schemas import Report, SSEEvent
 # ---------------------------------------------------------------------------
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-SAMPLE_WORKLOAD = REPO_ROOT / "workloads" / "train_llama3_lora.py"
+SAMPLE_WORKLOAD = REPO_ROOT / "workloads" / "train_qwen_lora.py"
 CACHED_AUDIT = REPO_ROOT / "tests" / "fixtures" / "cached_audit.json"
 
 DEFAULT_BACKEND = "http://localhost:8000/audit"
@@ -522,7 +522,7 @@ def main() -> None:
         st.write("")
         use_sample = st.button(
             "Use sample workload",
-            help=f"Audit {SAMPLE_WORKLOAD.name} (Llama-3-8B + LoRA, deliberately mis-tuned).",
+            help=f"Audit {SAMPLE_WORKLOAD.name} (Qwen2.5-7B-Instruct + LoRA, deliberately mis-tuned).",
         )
 
     if "uploaded_path" not in st.session_state:

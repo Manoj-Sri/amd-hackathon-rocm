@@ -28,7 +28,7 @@ from runner.protocol import FakeRunner, LiveRunner, _default_runner, gpu_availab
 
 def _baseline_config() -> WorkloadConfig:
     return WorkloadConfig(
-        model_name="meta-llama/Meta-Llama-3-8B",
+        model_name="Qwen/Qwen2.5-7B-Instruct",
         precision="fp16",
         batch_size=4,
         attention_impl="eager",

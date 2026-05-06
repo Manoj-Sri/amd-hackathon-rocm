@@ -188,7 +188,7 @@ class FakeRunner:
 # Defaults are pinned to the repo layout. Override via env vars in tests / CI.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _DEFAULT_RUNNER_SCRIPT = _REPO_ROOT / "runner" / "goblin_runner.sh"
-_DEFAULT_USER_SCRIPT = _REPO_ROOT / "workloads" / "train_llama3_lora.py"
+_DEFAULT_USER_SCRIPT = _REPO_ROOT / "workloads" / "train_qwen_lora.py"
 
 
 class LiveRunner:

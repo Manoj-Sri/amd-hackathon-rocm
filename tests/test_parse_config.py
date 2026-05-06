@@ -75,7 +75,7 @@ class TestPythonScript:
 
     def test_model_name_resolved(self) -> None:
         result = _parse_config(str(FIXTURES / "sample_train.py"))
-        assert result.result["model_name"] == "meta-llama/Meta-Llama-3-8B"
+        assert result.result["model_name"] == "Qwen/Qwen2.5-7B-Instruct"
 
 
 # ---------------------------------------------------------------------------
@@ -90,7 +90,7 @@ class TestJsonConfig:
 
     def test_field_mapping(self) -> None:
         cfg = _parse_config(str(FIXTURES / "sample_train.json")).result
-        assert cfg["model_name"] == "meta-llama/Meta-Llama-3-8B"
+        assert cfg["model_name"] == "Qwen/Qwen2.5-7B-Instruct"
         assert cfg["batch_size"] == 8
         assert cfg["grad_accum_steps"] == 4
         assert cfg["seq_len"] == 4096
@@ -162,7 +162,7 @@ class TestRedaction:
         assert "sk-abcdefghijklmnopqrstuvwxyz1234567890" not in raw
         assert "gho_abcdefghijklmnopqrstuvwxyz123456" not in raw
         assert "/home/researcher/datasets/alpaca" not in raw
-        assert "s3://my-team/checkpoints/llama3-lora/" not in raw
+        assert "s3://my-team/checkpoints/qwen-lora/" not in raw
         assert "wss://logs.internal.example.com/stream" not in raw
         assert "<REDACTED:hf_token>" in raw
         assert "<REDACTED:openai_key>" in raw
@@ -246,7 +246,7 @@ class TestSchema:
         result = _parse_config(str(FIXTURES / "sample_train.py"))
         # Must be reconstructible — guards against extras-vs-fields collisions.
         cfg = WorkloadConfig(**result.result)
-        assert cfg.model_name == "meta-llama/Meta-Llama-3-8B"
+        assert cfg.model_name == "Qwen/Qwen2.5-7B-Instruct"
 
     def test_defaults_when_field_absent(self, tmp_path: Path) -> None:
         # Minimal config — only model_name. Everything else should fall back to schema defaults.

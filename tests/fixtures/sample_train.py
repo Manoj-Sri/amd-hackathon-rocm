@@ -24,7 +24,7 @@ OPENAI_KEY = "sk-abcdefghijklmnopqrstuvwxyz1234567890"
 GH_TOKEN = "gho_abcdefghijklmnopqrstuvwxyz123456"
 AUTH_HEADER = "Authorization: Bearer eyJhbGciOi.JIUzI1NiJ9.signature123"
 DATA_ROOT = "/home/researcher/datasets/alpaca"
-S3_BUCKET = "s3://my-team/checkpoints/llama3-lora/"
+S3_BUCKET = "s3://my-team/checkpoints/qwen-lora/"
 WS_LOG = "wss://logs.internal.example.com/stream"
 
 # Environment variables the agent should capture into env_vars.
@@ -32,7 +32,7 @@ os.environ["HSA_FORCE_FINE_GRAIN_PCIE"] = "1"
 os.environ["MIOPEN_FIND_MODE"] = "3"
 os.environ["NCCL_MIN_NCHANNELS"] = "112"
 
-MODEL_ID = "meta-llama/Meta-Llama-3-8B"
+MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, token=HF_TOKEN)
 model = AutoModelForCausalLM.from_pretrained(

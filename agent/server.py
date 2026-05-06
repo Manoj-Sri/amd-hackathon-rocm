@@ -4,9 +4,10 @@ One audit endpoint plus a health probe. Streams the agent loop's `SSEEvent`s
 to the UI via Server-Sent Events. CORS is wide open because Streamlit runs on
 a different port — fine for a hackathon.
 
-Anthropic API key is read at startup. If it's missing the server still starts
-(so the offline-replay UI lane keeps working) but `/audit` will yield an
-`error` event and stop. We don't crash on missing keys.
+The agent runs on Qwen via Hugging Face Inference Providers. HF_TOKEN is
+read at startup; if it's missing the server still starts (so the offline-
+replay UI lane keeps working) but `/audit` yields a single error event.
+We never crash on missing keys.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 
+from agent.backends import active_backend_name
 from agent.loop import run_audit
 from agent.schemas import SSEEvent
 from agent.tools import ALL_TOOLS
@@ -36,16 +38,21 @@ app.add_middleware(
 )
 
 
-HAS_API_KEY: bool = bool(os.environ.get("ANTHROPIC_API_KEY"))
+def _has_hf_token() -> bool:
+    return bool(os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACEHUB_API_TOKEN"))
 
 
 @app.get("/healthz")
 async def healthz() -> dict:
-    """Liveness + tool inventory. UI uses this to confirm backend is up."""
+    """Liveness + tool inventory + active backend. UI uses this to confirm
+    the agent is reachable and configured."""
     return {
         "ok": True,
         "tools": [t.name for t in ALL_TOOLS],
-        "has_api_key": HAS_API_KEY,
+        "backend": active_backend_name(),
+        "model": os.environ.get("GOBLIN_QWEN_MODEL", "Qwen/Qwen2.5-7B-Instruct"),
+        "provider": os.environ.get("GOBLIN_QWEN_PROVIDER", "auto"),
+        "has_api_key": _has_hf_token(),
     }
 
 
@@ -54,15 +61,16 @@ async def _stream_audit(file_path: str) -> AsyncIterator[dict]:
     sse-starlette expects. Each yielded dict becomes one `data: ...\\n\\n`
     SSE message.
     """
-    if not os.environ.get("ANTHROPIC_API_KEY"):
+    if not _has_hf_token():
         # Surface a clean error instead of letting the loop crash on missing key.
         yield {
             "data": SSEEvent(
                 type="error",
                 data={
                     "message": (
-                        "ANTHROPIC_API_KEY not set on the server — agent loop "
-                        "is unavailable. Use the offline-replay UI lane."
+                        "HF_TOKEN not set on the server — Qwen agent loop is "
+                        "unavailable. Set HF_TOKEN (or HUGGINGFACEHUB_API_TOKEN) "
+                        "or use the offline-replay UI lane."
                     )
                 },
             ).model_dump_json()

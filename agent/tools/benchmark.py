@@ -35,7 +35,7 @@ _RUNNER = _default_runner()
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _CACHE_DIR = _REPO_ROOT / "bench_cache"
-_WORKLOAD_SCRIPT = _REPO_ROOT / "workloads" / "train_llama3_lora.py"
+_WORKLOAD_SCRIPT = _REPO_ROOT / "workloads" / "train_qwen_lora.py"
 _RUNNER_SCRIPT = _REPO_ROOT / "runner" / "goblin_runner.sh"
 
 

@@ -277,7 +277,7 @@ def _gpu_util_from_kernels(kernels: list[_Kernel], torch_summary: _TorchSummary)
 def _read_torch_profile(path: Path, warnings: list[str]) -> _TorchSummary:
     """Pull tokens/sec, MFU, and step timing from a torch.profiler artefact.
 
-    The user script (workloads/train_llama3_lora.py in Phase 3) is
+    The user script (workloads/train_qwen_lora.py in Phase 3) is
     responsible for embedding `tokens_per_sec`, `mfu_pct`, `pytorch_version`
     and `step_time_seconds` in the trace as `metadata` events. If those are
     missing, we estimate `step_time_seconds` from the total trace duration.

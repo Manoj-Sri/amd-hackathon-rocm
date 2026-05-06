@@ -1,8 +1,8 @@
 {
   "name": "01_baseline_bad",
-  "description": "Llama-3-8B LoRA, naive defaults: fp16, batch=4, no flash attention, no dataloader workers. Heavy data_wait + precision_path waste.",
+  "description": "Qwen2.5-7B LoRA, naive defaults: fp16, batch=4, no flash attention, no dataloader workers. Heavy data_wait + precision_path waste.",
   "match": {
-    "model_name": "meta-llama/Meta-Llama-3-8B",
+    "model_name": "Qwen/Qwen2.5-7B-Instruct",
     "precision": "fp16",
     "batch_size": 4,
     "attention_impl": "eager",

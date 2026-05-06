@@ -210,7 +210,7 @@
   expected_impact: >-
     Keeps DataLoader workers alive across epochs so the dataset doesn't
     re-initialize. Removes a 5-30 second hitch at every epoch boundary on
-    Llama-3 LoRA workloads.
+    Qwen2.5 LoRA workloads.
   rocm_version_min: "6.0"
   citation: "PyTorch DataLoader persistent_workers documentation"
 
@@ -223,7 +223,7 @@
   targets_bucket: host_gap
   symptom: >-
     torch.compile is disabled but the model is on the eager-mode-friendly
-    list (Llama, Mistral, Gemma, Qwen). Eager dispatch leaves host-gap
+    list (Qwen, Llama, Mistral, Gemma). Eager dispatch leaves host-gap
     bubbles between MI300X kernels that compile would erase.
   detect:
     torch_compile: false
@@ -232,7 +232,7 @@
   expected_recovery_fraction: 0.6
   expected_impact: >-
     torch.compile fuses small ops and removes Python dispatch overhead;
-    typical 1.1-1.3x throughput on Llama-class fine-tuning on MI300X. Verify
+    typical 1.1-1.3x throughput on Qwen-class fine-tuning on MI300X. Verify
     no graph breaks in your forward by running with TORCH_LOGS=graph_breaks.
   rocm_version_min: "6.0"
   citation: "PyTorch torch.compile + ROCm support matrix"
