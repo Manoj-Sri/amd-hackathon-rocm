@@ -1,0 +1,40 @@
+[project]
+name = "gpu-goblin"
+version = "0.1.0"
+description = "An AI agent that hunts wasted compute on AMD MI300X"
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi>=0.110",
+  "uvicorn[standard]>=0.27",
+  "anthropic>=0.40",
+  "pydantic>=2.6",
+  "pyyaml>=6.0",
+  "sentence-transformers>=2.7",
+  "numpy>=1.26",
+  "sse-starlette>=2.0",
+  "streamlit>=1.32",
+  "altair>=5.2",
+  "pandas>=2.2",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "pytest-asyncio>=0.23",
+  "ruff>=0.4",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["agent*", "runner*", "ui*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501"]

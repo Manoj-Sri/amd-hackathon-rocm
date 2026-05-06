@@ -1,1 +1,23 @@
 .claude/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# Goblin-specific
+bench_cache/
+*.trace.csv
+*.trace.json
+.env
+.anthropic-key
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store

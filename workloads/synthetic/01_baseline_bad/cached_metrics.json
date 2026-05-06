@@ -1,0 +1,32 @@
+{
+  "steps": 10,
+  "tokens_per_sec": 142.0,
+  "mfu_pct": 24.0,
+  "hbm_peak_gb": 73.0,
+  "hbm_avg_gb": 61.0,
+  "gpu_util_pct": 46.0,
+  "top_kernels": [
+    {"name": "aten::matmul (fp16)", "pct_time": 38.0},
+    {"name": "aten::scaled_dot_product_attention (eager)", "pct_time": 24.0},
+    {"name": "aten::layer_norm", "pct_time": 8.0},
+    {"name": "aten::cross_entropy_loss", "pct_time": 5.0},
+    {"name": "aten::copy_ (h2d)", "pct_time": 11.0}
+  ],
+  "attention_kernel_loaded": "eager",
+  "waste_budget": {
+    "useful_gpu": 0.42,
+    "data_wait": 0.21,
+    "host_gap": 0.06,
+    "comm_excess": 0.0,
+    "memory_headroom": 0.14,
+    "precision_path": 0.11,
+    "kernel_shape": 0.06
+  },
+  "warnings": [
+    "Attention kernel is 'eager'; flash_rocm or sdpa would be much faster.",
+    "HBM utilization 38% suggests batch_size is leaving memory on the floor."
+  ],
+  "rocm_version": "6.1.0",
+  "pytorch_version": "2.3.0+rocm6.1",
+  "runner_kind": "fake"
+}

@@ -1,0 +1,17 @@
+{
+  "name": "01_baseline_bad",
+  "description": "Llama-3-8B LoRA, naive defaults: fp16, batch=4, no flash attention, no dataloader workers. Heavy data_wait + precision_path waste.",
+  "match": {
+    "model_name": "meta-llama/Meta-Llama-3-8B",
+    "precision": "fp16",
+    "batch_size": 4,
+    "attention_impl": "eager",
+    "dataloader_workers": 0
+  },
+  "expected_findings": [
+    "precision.bf16_over_fp16_on_mi300x",
+    "attention.flash_rocm_over_eager",
+    "data.dataloader_workers_zero",
+    "memory.batch_too_small_for_192gb"
+  ]
+}

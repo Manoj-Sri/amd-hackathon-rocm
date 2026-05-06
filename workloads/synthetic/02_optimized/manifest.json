@@ -1,0 +1,10 @@
+{
+  "name": "02_optimized",
+  "description": "Llama-3-8B LoRA after Goblin patch: bf16, batch=12, flash_rocm attention, dataloader workers tuned. Recovers most of the data_wait/precision_path/memory_headroom buckets.",
+  "match": {
+    "model_name": "meta-llama/Meta-Llama-3-8B",
+    "precision": "bf16",
+    "attention_impl": "flash_rocm"
+  },
+  "expected_findings": []
+}
