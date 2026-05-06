@@ -12,6 +12,7 @@ venv/
 
 # Goblin-specific
 bench_cache/
+kb/.embeddings_cache_*.npy
 *.trace.csv
 *.trace.json
 .env

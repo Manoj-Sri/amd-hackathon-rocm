@@ -1,18 +1,19 @@
 """profile_run tool — short profiling pass (default 10 steps) returning RunMetrics.
 
-STUB IMPLEMENTATION — Phase 2 agent C replaces the body with a real rocprofv3 +
-torch.profiler wrapper that calls runner/goblin_runner.sh. The current stub
-delegates to FakeRunner, which loads cached metrics from
-workloads/synthetic/<scenario>/cached_metrics.json based on the WorkloadConfig.
+Delegates to `runner.protocol.LiveRunner`, which itself auto-falls-back to
+`FakeRunner` whenever the host can't actually run a live profile (no
+rocprofv3, no amd-smi, no /dev/dri/renderD*, subprocess failure, parse
+error). On a laptop you'll always see `runner_kind="fake"` with a clear
+warning prepended to `RunMetrics.warnings`.
 """
 
 from __future__ import annotations
 
 from agent.schemas import ToolResult, WorkloadConfig
 from agent.tools import Tool
-from runner.protocol import FakeRunner
+from runner.protocol import _default_runner
 
-_RUNNER = FakeRunner()
+_RUNNER = _default_runner()
 
 
 def _profile_run(config: dict, steps: int = 10) -> ToolResult:

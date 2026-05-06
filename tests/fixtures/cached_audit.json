@@ -1,0 +1,1263 @@
+[
+  {
+    "type": "thought",
+    "data": {
+      "text": "User uploaded a Llama-3 LoRA fine-tuning script. I'll start by parsing the configuration and redacting any secrets, then profile a short run on MI300X before consulting the ROCm playbook for known wins."
+    }
+  },
+  {
+    "type": "tool_call",
+    "data": {
+      "id": "tc-1",
+      "name": "parse_config",
+      "input": {
+        "file_path": "workloads/train_llama3_lora.py"
+      }
+    }
+  },
+  {
+    "type": "tool_result",
+    "data": {
+      "id": "tc-1",
+      "name": "parse_config",
+      "ok": true,
+      "result": {
+        "model_name": "meta-llama/Meta-Llama-3-8B",
+        "batch_size": 4,
+        "grad_accum_steps": 8,
+        "seq_len": 1024,
+        "precision": "fp16",
+        "optimizer": "adamw_torch",
+        "attention_impl": "eager",
+        "gradient_checkpointing": false,
+        "lora_rank": 16,
+        "dataloader_workers": 0,
+        "dataloader_pin_memory": false,
+        "dataloader_prefetch_factor": 2,
+        "dataloader_persistent_workers": false,
+        "torch_compile": false,
+        "lr": 0.0002,
+        "warmup_steps": 100,
+        "env_vars": {
+          "HF_TOKEN": "hf_aaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "HSA_FORCE_FINE_GRAIN_PCIE": "1",
+          "MIOPEN_FIND_MODE": "3"
+        },
+        "extras": {
+          "lora.lora_alpha": 32,
+          "lora.target_modules": [
+            "q_proj",
+            "v_proj"
+          ],
+          "lora.lora_dropout": 0.05,
+          "lora.bias": "none",
+          "lora.task_type": "CAUSAL_LM",
+          "batch_size": 4,
+          "output_dir": "./out",
+          "num_train_epochs": 3,
+          "logging_steps": 10,
+          "save_steps": 500,
+          "report_to": "none",
+          "push_to_hub": false
+        },
+        "raw_source": "# GPU Goblin canonical demo workload.\n#\n# Llama-3-8B + LoRA fine-tune on the alpaca-cleaned dataset, staged with\n# *deliberately* sub-optimal defaults so the goblin has something to fix in\n# the demo. This script does NOT need to actually execute on a host \u2014 it\n# exists so `parse_config` can extract a realistic WorkloadConfig from it.\n#\n# Expected findings when audited:\n#   - precision.bf16_over_fp16_on_mi300x   (fp16=True)\n#   - attention.flash_rocm_over_eager      (attn_implementation=\"eager\")\n#   - data.dataloader_workers_zero         (dataloader_num_workers=0)\n#   - memory.batch_too_small_for_192gb     (per_device_train_batch_size=4)\n\nimport os\n\nimport torch\nfrom datasets import load_dataset\nfrom peft import LoraConfig, get_peft_model\nfrom torch.utils.data import DataLoader\nfrom transformers import (\n    AutoModelForCausalLM,\n    AutoTokenizer,\n    Trainer,\n    TrainingArguments,\n)\n\n# A redactable secret so parse_config has something to scrub during the demo.\nos.environ[\"HF_TOKEN\"] = \"<REDACTED:hf_token>\"\nHF_TOKEN = os.environ[\"HF_TOKEN\"]\n\n# ROCm-flavored env knobs the agent should pick up into env_vars.\nos.environ[\"HSA_FORCE_FINE_GRAIN_PCIE\"] = \"1\"\nos.environ[\"MIOPEN_FIND_MODE\"] = \"3\"\n\nMODEL_ID = \"meta-llama/Meta-Llama-3-8B\"\n\ntokenizer = AutoTokenizer.from_pretrained(MODEL_ID, token=HF_TOKEN)\nmodel = AutoModelForCausalLM.from_pretrained(\n    MODEL_ID,\n    torch_dtype=torch.float16,\n    attn_implementation=\"eager\",  # naive attention -- goblin should swap to flash_rocm\n    token=HF_TOKEN,\n)\n\n# LoRA \u2014 rank 16, attached to attention projections.\nlora_config = LoraConfig(\n    r=16,\n    lora_alpha=32,\n    target_modules=[\"q_proj\", \"v_proj\"],\n    lora_dropout=0.05,\n    bias=\"none\",\n    task_type=\"CAUSAL_LM\",\n)\nmodel = get_peft_model(model, lora_config)\n\ndataset = load_dataset(\"yahma/alpaca-cleaned\", split=\"train\")\n\n# Hand-rolled DataLoader so parse_config sees the dataloader kwargs explicitly.\ntrain_loader = DataLoader(\n    dataset,\n    batch_size=4,\n    num_workers=0,        # leaves the GPU starved during training -- data_wait waste\n    pin_memory=False,\n    prefetch_factor=2,\n    persistent_workers=False,\n)\n\ntraining_args = TrainingArguments(\n    output_dir=\"./out\",\n    per_device_train_batch_size=4,        # leaves HBM on the floor at 192 GB\n    gradient_accumulation_steps=8,\n    num_train_epochs=3,\n    learning_rate=2e-4,\n    warmup_steps=100,\n    fp16=True,                             # bf16 is the right call on CDNA3\n    optim=\"adamw_torch\",\n    logging_steps=10,\n    save_steps=500,\n    dataloader_num_workers=0,\n    dataloader_pin_memory=False,\n    gradient_checkpointing=False,\n    torch_compile=False,\n    report_to=\"none\",\n    push_to_hub=False,\n)\n\ntrainer = Trainer(\n    model=model,\n    args=training_args,\n    train_dataset=dataset,\n    tokenizer=tokenizer,\n)\n\nif __name__ == \"__main__\":\n    trainer.train()\n",
+        "redactions": [
+          "hf_token"
+        ]
+      }
+    }
+  },
+  {
+    "type": "tool_call",
+    "data": {
+      "id": "tc-2",
+      "name": "profile_run",
+      "input": {
+        "config": {
+          "model_name": "meta-llama/Meta-Llama-3-8B",
+          "batch_size": 4,
+          "grad_accum_steps": 8,
+          "seq_len": 1024,
+          "precision": "fp16",
+          "optimizer": "adamw_torch",
+          "attention_impl": "eager",
+          "gradient_checkpointing": false,
+          "lora_rank": 16,
+          "dataloader_workers": 0,
+          "dataloader_pin_memory": false,
+          "dataloader_prefetch_factor": 2,
+          "dataloader_persistent_workers": false,
+          "torch_compile": false,
+          "lr": 0.0002,
+          "warmup_steps": 100,
+          "env_vars": {
+            "HF_TOKEN": "hf_aaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "HSA_FORCE_FINE_GRAIN_PCIE": "1",
+            "MIOPEN_FIND_MODE": "3"
+          },
+          "extras": {
+            "lora.lora_alpha": 32,
+            "lora.target_modules": [
+              "q_proj",
+              "v_proj"
+            ],
+            "lora.lora_dropout": 0.05,
+            "lora.bias": "none",
+            "lora.task_type": "CAUSAL_LM",
+            "batch_size": 4,
+            "output_dir": "./out",
+            "num_train_epochs": 3,
+            "logging_steps": 10,
+            "save_steps": 500,
+            "report_to": "none",
+            "push_to_hub": false
+          },
+          "raw_source": "# GPU Goblin canonical demo workload.\n#\n# Llama-3-8B + LoRA fine-tune on the alpaca-cleaned dataset, staged with\n# *deliberately* sub-optimal defaults so the goblin has something to fix in\n# the demo. This script does NOT need to actually execute on a host \u2014 it\n# exists so `parse_config` can extract a realistic WorkloadConfig from it.\n#\n# Expected findings when audited:\n#   - precision.bf16_over_fp16_on_mi300x   (fp16=True)\n#   - attention.flash_rocm_over_eager      (attn_implementation=\"eager\")\n#   - data.dataloader_workers_zero         (dataloader_num_workers=0)\n#   - memory.batch_too_small_for_192gb     (per_device_train_batch_size=4)\n\nimport os\n\nimport torch\nfrom datasets import load_dataset\nfrom peft import LoraConfig, get_peft_model\nfrom torch.utils.data import DataLoader\nfrom transformers import (\n    AutoModelForCausalLM,\n    AutoTokenizer,\n    Trainer,\n    TrainingArguments,\n)\n\n# A redactable secret so parse_config has something to scrub during the demo.\nos.environ[\"HF_TOKEN\"] = \"<REDACTED:hf_token>\"\nHF_TOKEN = os.environ[\"HF_TOKEN\"]\n\n# ROCm-flavored env knobs the agent should pick up into env_vars.\nos.environ[\"HSA_FORCE_FINE_GRAIN_PCIE\"] = \"1\"\nos.environ[\"MIOPEN_FIND_MODE\"] = \"3\"\n\nMODEL_ID = \"meta-llama/Meta-Llama-3-8B\"\n\ntokenizer = AutoTokenizer.from_pretrained(MODEL_ID, token=HF_TOKEN)\nmodel = AutoModelForCausalLM.from_pretrained(\n    MODEL_ID,\n    torch_dtype=torch.float16,\n    attn_implementation=\"eager\",  # naive attention -- goblin should swap to flash_rocm\n    token=HF_TOKEN,\n)\n\n# LoRA \u2014 rank 16, attached to attention projections.\nlora_config = LoraConfig(\n    r=16,\n    lora_alpha=32,\n    target_modules=[\"q_proj\", \"v_proj\"],\n    lora_dropout=0.05,\n    bias=\"none\",\n    task_type=\"CAUSAL_LM\",\n)\nmodel = get_peft_model(model, lora_config)\n\ndataset = load_dataset(\"yahma/alpaca-cleaned\", split=\"train\")\n\n# Hand-rolled DataLoader so parse_config sees the dataloader kwargs explicitly.\ntrain_loader = DataLoader(\n    dataset,\n    batch_size=4,\n    num_workers=0,        # leaves the GPU starved during training -- data_wait waste\n    pin_memory=False,\n    prefetch_factor=2,\n    persistent_workers=False,\n)\n\ntraining_args = TrainingArguments(\n    output_dir=\"./out\",\n    per_device_train_batch_size=4,        # leaves HBM on the floor at 192 GB\n    gradient_accumulation_steps=8,\n    num_train_epochs=3,\n    learning_rate=2e-4,\n    warmup_steps=100,\n    fp16=True,                             # bf16 is the right call on CDNA3\n    optim=\"adamw_torch\",\n    logging_steps=10,\n    save_steps=500,\n    dataloader_num_workers=0,\n    dataloader_pin_memory=False,\n    gradient_checkpointing=False,\n    torch_compile=False,\n    report_to=\"none\",\n    push_to_hub=False,\n)\n\ntrainer = Trainer(\n    model=model,\n    args=training_args,\n    train_dataset=dataset,\n    tokenizer=tokenizer,\n)\n\nif __name__ == \"__main__\":\n    trainer.train()\n",
+          "redactions": [
+            "hf_token"
+          ]
+        },
+        "steps": 10
+      }
+    }
+  },
+  {
+    "type": "tool_result",
+    "data": {
+      "id": "tc-2",
+      "name": "profile_run",
+      "ok": true,
+      "result": {
+        "steps": 10,
+        "tokens_per_sec": 142.0,
+        "mfu_pct": 24.0,
+        "hbm_peak_gb": 73.0,
+        "hbm_avg_gb": 61.0,
+        "gpu_util_pct": 46.0,
+        "top_kernels": [
+          {
+            "name": "aten::matmul (fp16)",
+            "pct_time": 38.0
+          },
+          {
+            "name": "aten::scaled_dot_product_attention (eager)",
+            "pct_time": 24.0
+          },
+          {
+            "name": "aten::layer_norm",
+            "pct_time": 8.0
+          },
+          {
+            "name": "aten::cross_entropy_loss",
+            "pct_time": 5.0
+          },
+          {
+            "name": "aten::copy_ (h2d)",
+            "pct_time": 11.0
+          }
+        ],
+        "attention_kernel_loaded": "eager",
+        "waste_budget": {
+          "useful_gpu": 0.42,
+          "data_wait": 0.21,
+          "host_gap": 0.06,
+          "comm_excess": 0.0,
+          "memory_headroom": 0.14,
+          "precision_path": 0.11,
+          "kernel_shape": 0.06
+        },
+        "warnings": [
+          "Attention kernel is 'eager'; flash_rocm or sdpa would be much faster.",
+          "HBM utilization 38% suggests batch_size is leaving memory on the floor."
+        ],
+        "rocm_version": "6.1.0",
+        "pytorch_version": "2.3.0+rocm6.1",
+        "runner_kind": "fake"
+      }
+    }
+  },
+  {
+    "type": "thought",
+    "data": {
+      "text": "Profile shows 142 tok/s at 24% MFU \u2014 the precision_path and kernel_shape buckets are heavy. Querying the ROCm KB for matching rules."
+    }
+  },
+  {
+    "type": "tool_call",
+    "data": {
+      "id": "tc-3",
+      "name": "query_rocm_kb",
+      "input": {
+        "symptom": "fp16 with eager attention and zero dataloader workers on MI300X",
+        "top_k": 6
+      }
+    }
+  },
+  {
+    "type": "tool_result",
+    "data": {
+      "id": "tc-3",
+      "name": "query_rocm_kb",
+      "ok": true,
+      "result": {
+        "rules": [
+          {
+            "id": "precision.bf16_over_fp16_on_mi300x",
+            "category": "precision",
+            "targets_bucket": "precision_path",
+            "symptom": "fp16 used on MI300X / CDNA3",
+            "detect": {
+              "precision": "fp16"
+            },
+            "transform": {
+              "precision": "bf16"
+            },
+            "expected_recovery_fraction": 0.85,
+            "expected_impact": "MI300X CDNA3 matrix cores execute bf16 at the same throughput as fp16 with strictly better numerical stability. Reduces NaN risk in long runs.",
+            "rocm_version_min": "6.0",
+            "citation": "ROCm MI300X Optimization Guide \u00a73.2 \u2014 bf16 vs fp16"
+          },
+          {
+            "id": "attention.flash_rocm_over_eager",
+            "category": "attention",
+            "targets_bucket": "kernel_shape",
+            "symptom": "naive (eager) attention on MI300X \u2014 no flash kernel loaded",
+            "detect": {
+              "attention_impl": "eager"
+            },
+            "transform": {
+              "attention_impl": "flash_rocm"
+            },
+            "expected_recovery_fraction": 0.7,
+            "expected_impact": "Use the ROCm-validated flash-attention kernel (via Optimum-AMD or PyTorch SDPA backend). Eliminates O(seq_len^2) attention memory; typically 2-3x faster on MI300X for seq_len >= 1024.",
+            "rocm_version_min": "6.0",
+            "citation": "AMD ROCm vLLM/Optimum-AMD docs \u2014 Flash Attention validated on MI300"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "tool_call",
+    "data": {
+      "id": "tc-4",
+      "name": "propose_patch",
+      "input": {
+        "config": {
+          "model_name": "meta-llama/Meta-Llama-3-8B",
+          "batch_size": 4,
+          "grad_accum_steps": 8,
+          "seq_len": 1024,
+          "precision": "fp16",
+          "optimizer": "adamw_torch",
+          "attention_impl": "eager",
+          "gradient_checkpointing": false,
+          "lora_rank": 16,
+          "dataloader_workers": 0,
+          "dataloader_pin_memory": false,
+          "dataloader_prefetch_factor": 2,
+          "dataloader_persistent_workers": false,
+          "torch_compile": false,
+          "lr": 0.0002,
+          "warmup_steps": 100,
+          "env_vars": {
+            "HF_TOKEN": "hf_aaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "HSA_FORCE_FINE_GRAIN_PCIE": "1",
+            "MIOPEN_FIND_MODE": "3"
+          },
+          "extras": {
+            "lora.lora_alpha": 32,
+            "lora.target_modules": [
+              "q_proj",
+              "v_proj"
+            ],
+            "lora.lora_dropout": 0.05,
+            "lora.bias": "none",
+            "lora.task_type": "CAUSAL_LM",
+            "batch_size": 4,
+            "output_dir": "./out",
+            "num_train_epochs": 3,
+            "logging_steps": 10,
+            "save_steps": 500,
+            "report_to": "none",
+            "push_to_hub": false
+          },
+          "raw_source": "# GPU Goblin canonical demo workload.\n#\n# Llama-3-8B + LoRA fine-tune on the alpaca-cleaned dataset, staged with\n# *deliberately* sub-optimal defaults so the goblin has something to fix in\n# the demo. This script does NOT need to actually execute on a host \u2014 it\n# exists so `parse_config` can extract a realistic WorkloadConfig from it.\n#\n# Expected findings when audited:\n#   - precision.bf16_over_fp16_on_mi300x   (fp16=True)\n#   - attention.flash_rocm_over_eager      (attn_implementation=\"eager\")\n#   - data.dataloader_workers_zero         (dataloader_num_workers=0)\n#   - memory.batch_too_small_for_192gb     (per_device_train_batch_size=4)\n\nimport os\n\nimport torch\nfrom datasets import load_dataset\nfrom peft import LoraConfig, get_peft_model\nfrom torch.utils.data import DataLoader\nfrom transformers import (\n    AutoModelForCausalLM,\n    AutoTokenizer,\n    Trainer,\n    TrainingArguments,\n)\n\n# A redactable secret so parse_config has something to scrub during the demo.\nos.environ[\"HF_TOKEN\"] = \"<REDACTED:hf_token>\"\nHF_TOKEN = os.environ[\"HF_TOKEN\"]\n\n# ROCm-flavored env knobs the agent should pick up into env_vars.\nos.environ[\"HSA_FORCE_FINE_GRAIN_PCIE\"] = \"1\"\nos.environ[\"MIOPEN_FIND_MODE\"] = \"3\"\n\nMODEL_ID = \"meta-llama/Meta-Llama-3-8B\"\n\ntokenizer = AutoTokenizer.from_pretrained(MODEL_ID, token=HF_TOKEN)\nmodel = AutoModelForCausalLM.from_pretrained(\n    MODEL_ID,\n    torch_dtype=torch.float16,\n    attn_implementation=\"eager\",  # naive attention -- goblin should swap to flash_rocm\n    token=HF_TOKEN,\n)\n\n# LoRA \u2014 rank 16, attached to attention projections.\nlora_config = LoraConfig(\n    r=16,\n    lora_alpha=32,\n    target_modules=[\"q_proj\", \"v_proj\"],\n    lora_dropout=0.05,\n    bias=\"none\",\n    task_type=\"CAUSAL_LM\",\n)\nmodel = get_peft_model(model, lora_config)\n\ndataset = load_dataset(\"yahma/alpaca-cleaned\", split=\"train\")\n\n# Hand-rolled DataLoader so parse_config sees the dataloader kwargs explicitly.\ntrain_loader = DataLoader(\n    dataset,\n    batch_size=4,\n    num_workers=0,        # leaves the GPU starved during training -- data_wait waste\n    pin_memory=False,\n    prefetch_factor=2,\n    persistent_workers=False,\n)\n\ntraining_args = TrainingArguments(\n    output_dir=\"./out\",\n    per_device_train_batch_size=4,        # leaves HBM on the floor at 192 GB\n    gradient_accumulation_steps=8,\n    num_train_epochs=3,\n    learning_rate=2e-4,\n    warmup_steps=100,\n    fp16=True,                             # bf16 is the right call on CDNA3\n    optim=\"adamw_torch\",\n    logging_steps=10,\n    save_steps=500,\n    dataloader_num_workers=0,\n    dataloader_pin_memory=False,\n    gradient_checkpointing=False,\n    torch_compile=False,\n    report_to=\"none\",\n    push_to_hub=False,\n)\n\ntrainer = Trainer(\n    model=model,\n    args=training_args,\n    train_dataset=dataset,\n    tokenizer=tokenizer,\n)\n\nif __name__ == \"__main__\":\n    trainer.train()\n",
+          "redactions": [
+            "hf_token"
+          ]
+        },
+        "rules": [
+          {
+            "id": "precision.bf16_over_fp16_on_mi300x",
+            "category": "precision",
+            "targets_bucket": "precision_path",
+            "symptom": "fp16 used on MI300X / CDNA3",
+            "detect": {
+              "precision": "fp16"
+            },
+            "transform": {
+              "precision": "bf16"
+            },
+            "expected_recovery_fraction": 0.85,
+            "expected_impact": "MI300X CDNA3 matrix cores execute bf16 at the same throughput as fp16 with strictly better numerical stability. Reduces NaN risk in long runs.",
+            "rocm_version_min": "6.0",
+            "citation": "ROCm MI300X Optimization Guide \u00a73.2 \u2014 bf16 vs fp16"
+          },
+          {
+            "id": "attention.flash_rocm_over_eager",
+            "category": "attention",
+            "targets_bucket": "kernel_shape",
+            "symptom": "naive (eager) attention on MI300X \u2014 no flash kernel loaded",
+            "detect": {
+              "attention_impl": "eager"
+            },
+            "transform": {
+              "attention_impl": "flash_rocm"
+            },
+            "expected_recovery_fraction": 0.7,
+            "expected_impact": "Use the ROCm-validated flash-attention kernel (via Optimum-AMD or PyTorch SDPA backend). Eliminates O(seq_len^2) attention memory; typically 2-3x faster on MI300X for seq_len >= 1024.",
+            "rocm_version_min": "6.0",
+            "citation": "AMD ROCm vLLM/Optimum-AMD docs \u2014 Flash Attention validated on MI300"
+          }
+        ],
+        "metrics": {
+          "steps": 10,
+          "tokens_per_sec": 142.0,
+          "mfu_pct": 24.0,
+          "hbm_peak_gb": 73.0,
+          "hbm_avg_gb": 61.0,
+          "gpu_util_pct": 46.0,
+          "top_kernels": [
+            {
+              "name": "aten::matmul (fp16)",
+              "pct_time": 38.0
+            },
+            {
+              "name": "aten::scaled_dot_product_attention (eager)",
+              "pct_time": 24.0
+            },
+            {
+              "name": "aten::layer_norm",
+              "pct_time": 8.0
+            },
+            {
+              "name": "aten::cross_entropy_loss",
+              "pct_time": 5.0
+            },
+            {
+              "name": "aten::copy_ (h2d)",
+              "pct_time": 11.0
+            }
+          ],
+          "attention_kernel_loaded": "eager",
+          "waste_budget": {
+            "useful_gpu": 0.42,
+            "data_wait": 0.21,
+            "host_gap": 0.06,
+            "comm_excess": 0.0,
+            "memory_headroom": 0.14,
+            "precision_path": 0.11,
+            "kernel_shape": 0.06
+          },
+          "warnings": [
+            "Attention kernel is 'eager'; flash_rocm or sdpa would be much faster.",
+            "HBM utilization 38% suggests batch_size is leaving memory on the floor."
+          ],
+          "rocm_version": "6.1.0",
+          "pytorch_version": "2.3.0+rocm6.1",
+          "runner_kind": "fake"
+        }
+      }
+    }
+  },
+  {
+    "type": "tool_result",
+    "data": {
+      "id": "tc-4",
+      "name": "propose_patch",
+      "ok": true,
+      "result": {
+        "new_config": {
+          "model_name": "meta-llama/Meta-Llama-3-8B",
+          "batch_size": 4,
+          "grad_accum_steps": 8,
+          "seq_len": 1024,
+          "precision": "bf16",
+          "optimizer": "adamw_torch",
+          "attention_impl": "flash_rocm",
+          "gradient_checkpointing": false,
+          "lora_rank": 16,
+          "dataloader_workers": 0,
+          "dataloader_pin_memory": false,
+          "dataloader_prefetch_factor": 2,
+          "dataloader_persistent_workers": false,
+          "torch_compile": false,
+          "lr": 0.0002,
+          "warmup_steps": 100,
+          "env_vars": {
+            "HF_TOKEN": "hf_aaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "HSA_FORCE_FINE_GRAIN_PCIE": "1",
+            "MIOPEN_FIND_MODE": "3"
+          },
+          "extras": {
+            "lora.lora_alpha": 32,
+            "lora.target_modules": [
+              "q_proj",
+              "v_proj"
+            ],
+            "lora.lora_dropout": 0.05,
+            "lora.bias": "none",
+            "lora.task_type": "CAUSAL_LM",
+            "batch_size": 4,
+            "output_dir": "./out",
+            "num_train_epochs": 3,
+            "logging_steps": 10,
+            "save_steps": 500,
+            "report_to": "none",
+            "push_to_hub": false
+          },
+          "raw_source": "# GPU Goblin canonical demo workload.\n#\n# Llama-3-8B + LoRA fine-tune on the alpaca-cleaned dataset, staged with\n# *deliberately* sub-optimal defaults so the goblin has something to fix in\n# the demo. This script does NOT need to actually execute on a host \u2014 it\n# exists so `parse_config` can extract a realistic WorkloadConfig from it.\n#\n# Expected findings when audited:\n#   - precision.bf16_over_fp16_on_mi300x   (fp16=True)\n#   - attention.flash_rocm_over_eager      (attn_implementation=\"eager\")\n#   - data.dataloader_workers_zero         (dataloader_num_workers=0)\n#   - memory.batch_too_small_for_192gb     (per_device_train_batch_size=4)\n\nimport os\n\nimport torch\nfrom datasets import load_dataset\nfrom peft import LoraConfig, get_peft_model\nfrom torch.utils.data import DataLoader\nfrom transformers import (\n    AutoModelForCausalLM,\n    AutoTokenizer,\n    Trainer,\n    TrainingArguments,\n)\n\n# A redactable secret so parse_config has something to scrub during the demo.\nos.environ[\"HF_TOKEN\"] = \"<REDACTED:hf_token>\"\nHF_TOKEN = os.environ[\"HF_TOKEN\"]\n\n# ROCm-flavored env knobs the agent should pick up into env_vars.\nos.environ[\"HSA_FORCE_FINE_GRAIN_PCIE\"] = \"1\"\nos.environ[\"MIOPEN_FIND_MODE\"] = \"3\"\n\nMODEL_ID = \"meta-llama/Meta-Llama-3-8B\"\n\ntokenizer = AutoTokenizer.from_pretrained(MODEL_ID, token=HF_TOKEN)\nmodel = AutoModelForCausalLM.from_pretrained(\n    MODEL_ID,\n    torch_dtype=torch.float16,\n    attn_implementation=\"eager\",  # naive attention -- goblin should swap to flash_rocm\n    token=HF_TOKEN,\n)\n\n# LoRA \u2014 rank 16, attached to attention projections.\nlora_config = LoraConfig(\n    r=16,\n    lora_alpha=32,\n    target_modules=[\"q_proj\", \"v_proj\"],\n    lora_dropout=0.05,\n    bias=\"none\",\n    task_type=\"CAUSAL_LM\",\n)\nmodel = get_peft_model(model, lora_config)\n\ndataset = load_dataset(\"yahma/alpaca-cleaned\", split=\"train\")\n\n# Hand-rolled DataLoader so parse_config sees the dataloader kwargs explicitly.\ntrain_loader = DataLoader(\n    dataset,\n    batch_size=4,\n    num_workers=0,        # leaves the GPU starved during training -- data_wait waste\n    pin_memory=False,\n    prefetch_factor=2,\n    persistent_workers=False,\n)\n\ntraining_args = TrainingArguments(\n    output_dir=\"./out\",\n    per_device_train_batch_size=4,        # leaves HBM on the floor at 192 GB\n    gradient_accumulation_steps=8,\n    num_train_epochs=3,\n    learning_rate=2e-4,\n    warmup_steps=100,\n    fp16=True,                             # bf16 is the right call on CDNA3\n    optim=\"adamw_torch\",\n    logging_steps=10,\n    save_steps=500,\n    dataloader_num_workers=0,\n    dataloader_pin_memory=False,\n    gradient_checkpointing=False,\n    torch_compile=False,\n    report_to=\"none\",\n    push_to_hub=False,\n)\n\ntrainer = Trainer(\n    model=model,\n    args=training_args,\n    train_dataset=dataset,\n    tokenizer=tokenizer,\n)\n\nif __name__ == \"__main__\":\n    trainer.train()\n",
+          "redactions": [
+            "hf_token"
+          ]
+        },
+        "diff": "- attention_impl: 'eager'\n+ attention_impl: 'flash_rocm'\n- precision: 'fp16'\n+ precision: 'bf16'",
+        "rationale": [
+          {
+            "rule_id": "precision.bf16_over_fp16_on_mi300x",
+            "rationale": "MI300X CDNA3 matrix cores execute bf16 at the same throughput as fp16 with strictly better numerical stability. Reduces NaN risk in long runs.",
+            "citation": "ROCm MI300X Optimization Guide \u00a73.2 \u2014 bf16 vs fp16",
+            "targets_bucket": "precision_path",
+            "estimated_recovery_seconds": 0.0935
+          },
+          {
+            "rule_id": "attention.flash_rocm_over_eager",
+            "rationale": "Use the ROCm-validated flash-attention kernel (via Optimum-AMD or PyTorch SDPA backend). Eliminates O(seq_len^2) attention memory; typically 2-3x faster on MI300X for seq_len >= 1024.",
+            "citation": "AMD ROCm vLLM/Optimum-AMD docs \u2014 Flash Attention validated on MI300",
+            "targets_bucket": "kernel_shape",
+            "estimated_recovery_seconds": 0.041999999999999996
+          }
+        ],
+        "expected_speedup_low": 1.04,
+        "expected_speedup_high": 1.31,
+        "confidence": 0.85
+      }
+    }
+  },
+  {
+    "type": "tool_call",
+    "data": {
+      "id": "tc-5",
+      "name": "benchmark",
+      "input": {
+        "config": {
+          "model_name": "meta-llama/Meta-Llama-3-8B",
+          "batch_size": 4,
+          "grad_accum_steps": 8,
+          "seq_len": 1024,
+          "precision": "fp16",
+          "optimizer": "adamw_torch",
+          "attention_impl": "eager",
+          "gradient_checkpointing": false,
+          "lora_rank": 16,
+          "dataloader_workers": 0,
+          "dataloader_pin_memory": false,
+          "dataloader_prefetch_factor": 2,
+          "dataloader_persistent_workers": false,
+          "torch_compile": false,
+          "lr": 0.0002,
+          "warmup_steps": 100,
+          "env_vars": {
+            "HF_TOKEN": "hf_aaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "HSA_FORCE_FINE_GRAIN_PCIE": "1",
+            "MIOPEN_FIND_MODE": "3"
+          },
+          "extras": {
+            "lora.lora_alpha": 32,
+            "lora.target_modules": [
+              "q_proj",
+              "v_proj"
+            ],
+            "lora.lora_dropout": 0.05,
+            "lora.bias": "none",
+            "lora.task_type": "CAUSAL_LM",
+            "batch_size": 4,
+            "output_dir": "./out",
+            "num_train_epochs": 3,
+            "logging_steps": 10,
+            "save_steps": 500,
+            "report_to": "none",
+            "push_to_hub": false
+          },
+          "raw_source": "# GPU Goblin canonical demo workload.\n#\n# Llama-3-8B + LoRA fine-tune on the alpaca-cleaned dataset, staged with\n# *deliberately* sub-optimal defaults so the goblin has something to fix in\n# the demo. This script does NOT need to actually execute on a host \u2014 it\n# exists so `parse_config` can extract a realistic WorkloadConfig from it.\n#\n# Expected findings when audited:\n#   - precision.bf16_over_fp16_on_mi300x   (fp16=True)\n#   - attention.flash_rocm_over_eager      (attn_implementation=\"eager\")\n#   - data.dataloader_workers_zero         (dataloader_num_workers=0)\n#   - memory.batch_too_small_for_192gb     (per_device_train_batch_size=4)\n\nimport os\n\nimport torch\nfrom datasets import load_dataset\nfrom peft import LoraConfig, get_peft_model\nfrom torch.utils.data import DataLoader\nfrom transformers import (\n    AutoModelForCausalLM,\n    AutoTokenizer,\n    Trainer,\n    TrainingArguments,\n)\n\n# A redactable secret so parse_config has something to scrub during the demo.\nos.environ[\"HF_TOKEN\"] = \"<REDACTED:hf_token>\"\nHF_TOKEN = os.environ[\"HF_TOKEN\"]\n\n# ROCm-flavored env knobs the agent should pick up into env_vars.\nos.environ[\"HSA_FORCE_FINE_GRAIN_PCIE\"] = \"1\"\nos.environ[\"MIOPEN_FIND_MODE\"] = \"3\"\n\nMODEL_ID = \"meta-llama/Meta-Llama-3-8B\"\n\ntokenizer = AutoTokenizer.from_pretrained(MODEL_ID, token=HF_TOKEN)\nmodel = AutoModelForCausalLM.from_pretrained(\n    MODEL_ID,\n    torch_dtype=torch.float16,\n    attn_implementation=\"eager\",  # naive attention -- goblin should swap to flash_rocm\n    token=HF_TOKEN,\n)\n\n# LoRA \u2014 rank 16, attached to attention projections.\nlora_config = LoraConfig(\n    r=16,\n    lora_alpha=32,\n    target_modules=[\"q_proj\", \"v_proj\"],\n    lora_dropout=0.05,\n    bias=\"none\",\n    task_type=\"CAUSAL_LM\",\n)\nmodel = get_peft_model(model, lora_config)\n\ndataset = load_dataset(\"yahma/alpaca-cleaned\", split=\"train\")\n\n# Hand-rolled DataLoader so parse_config sees the dataloader kwargs explicitly.\ntrain_loader = DataLoader(\n    dataset,\n    batch_size=4,\n    num_workers=0,        # leaves the GPU starved during training -- data_wait waste\n    pin_memory=False,\n    prefetch_factor=2,\n    persistent_workers=False,\n)\n\ntraining_args = TrainingArguments(\n    output_dir=\"./out\",\n    per_device_train_batch_size=4,        # leaves HBM on the floor at 192 GB\n    gradient_accumulation_steps=8,\n    num_train_epochs=3,\n    learning_rate=2e-4,\n    warmup_steps=100,\n    fp16=True,                             # bf16 is the right call on CDNA3\n    optim=\"adamw_torch\",\n    logging_steps=10,\n    save_steps=500,\n    dataloader_num_workers=0,\n    dataloader_pin_memory=False,\n    gradient_checkpointing=False,\n    torch_compile=False,\n    report_to=\"none\",\n    push_to_hub=False,\n)\n\ntrainer = Trainer(\n    model=model,\n    args=training_args,\n    train_dataset=dataset,\n    tokenizer=tokenizer,\n)\n\nif __name__ == \"__main__\":\n    trainer.train()\n",
+          "redactions": [
+            "hf_token"
+          ]
+        },
+        "steps": 50
+      }
+    }
+  },
+  {
+    "type": "tool_result",
+    "data": {
+      "id": "tc-5",
+      "name": "benchmark",
+      "ok": true,
+      "result": {
+        "steps": 50,
+        "tokens_per_sec": 142.0,
+        "mfu_pct": 24.0,
+        "hbm_peak_gb": 73.0,
+        "hbm_avg_gb": 61.0,
+        "gpu_util_pct": 46.0,
+        "top_kernels": [
+          {
+            "name": "aten::matmul (fp16)",
+            "pct_time": 38.0
+          },
+          {
+            "name": "aten::scaled_dot_product_attention (eager)",
+            "pct_time": 24.0
+          },
+          {
+            "name": "aten::layer_norm",
+            "pct_time": 8.0
+          },
+          {
+            "name": "aten::cross_entropy_loss",
+            "pct_time": 5.0
+          },
+          {
+            "name": "aten::copy_ (h2d)",
+            "pct_time": 11.0
+          }
+        ],
+        "attention_kernel_loaded": "eager",
+        "waste_budget": {
+          "useful_gpu": 0.42,
+          "data_wait": 0.21,
+          "host_gap": 0.06,
+          "comm_excess": 0.0,
+          "memory_headroom": 0.14,
+          "precision_path": 0.11,
+          "kernel_shape": 0.06
+        },
+        "warnings": [
+          "Attention kernel is 'eager'; flash_rocm or sdpa would be much faster.",
+          "HBM utilization 38% suggests batch_size is leaving memory on the floor."
+        ],
+        "rocm_version": "6.1.0",
+        "pytorch_version": "2.3.0+rocm6.1",
+        "runner_kind": "fake"
+      }
+    }
+  },
+  {
+    "type": "tool_call",
+    "data": {
+      "id": "tc-6",
+      "name": "benchmark",
+      "input": {
+        "config": {
+          "model_name": "meta-llama/Meta-Llama-3-8B",
+          "batch_size": 4,
+          "grad_accum_steps": 8,
+          "seq_len": 1024,
+          "precision": "bf16",
+          "optimizer": "adamw_torch",
+          "attention_impl": "flash_rocm",
+          "gradient_checkpointing": false,
+          "lora_rank": 16,
+          "dataloader_workers": 0,
+          "dataloader_pin_memory": false,
+          "dataloader_prefetch_factor": 2,
+          "dataloader_persistent_workers": false,
+          "torch_compile": false,
+          "lr": 0.0002,
+          "warmup_steps": 100,
+          "env_vars": {
+            "HF_TOKEN": "hf_aaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "HSA_FORCE_FINE_GRAIN_PCIE": "1",
+            "MIOPEN_FIND_MODE": "3"
+          },
+          "extras": {
+            "lora.lora_alpha": 32,
+            "lora.target_modules": [
+              "q_proj",
+              "v_proj"
+            ],
+            "lora.lora_dropout": 0.05,
+            "lora.bias": "none",
+            "lora.task_type": "CAUSAL_LM",
+            "batch_size": 4,
+            "output_dir": "./out",
+            "num_train_epochs": 3,
+            "logging_steps": 10,
+            "save_steps": 500,
+            "report_to": "none",
+            "push_to_hub": false
+          },
+          "raw_source": "# GPU Goblin canonical demo workload.\n#\n# Llama-3-8B + LoRA fine-tune on the alpaca-cleaned dataset, staged with\n# *deliberately* sub-optimal defaults so the goblin has something to fix in\n# the demo. This script does NOT need to actually execute on a host \u2014 it\n# exists so `parse_config` can extract a realistic WorkloadConfig from it.\n#\n# Expected findings when audited:\n#   - precision.bf16_over_fp16_on_mi300x   (fp16=True)\n#   - attention.flash_rocm_over_eager      (attn_implementation=\"eager\")\n#   - data.dataloader_workers_zero         (dataloader_num_workers=0)\n#   - memory.batch_too_small_for_192gb     (per_device_train_batch_size=4)\n\nimport os\n\nimport torch\nfrom datasets import load_dataset\nfrom peft import LoraConfig, get_peft_model\nfrom torch.utils.data import DataLoader\nfrom transformers import (\n    AutoModelForCausalLM,\n    AutoTokenizer,\n    Trainer,\n    TrainingArguments,\n)\n\n# A redactable secret so parse_config has something to scrub during the demo.\nos.environ[\"HF_TOKEN\"] = \"<REDACTED:hf_token>\"\nHF_TOKEN = os.environ[\"HF_TOKEN\"]\n\n# ROCm-flavored env knobs the agent should pick up into env_vars.\nos.environ[\"HSA_FORCE_FINE_GRAIN_PCIE\"] = \"1\"\nos.environ[\"MIOPEN_FIND_MODE\"] = \"3\"\n\nMODEL_ID = \"meta-llama/Meta-Llama-3-8B\"\n\ntokenizer = AutoTokenizer.from_pretrained(MODEL_ID, token=HF_TOKEN)\nmodel = AutoModelForCausalLM.from_pretrained(\n    MODEL_ID,\n    torch_dtype=torch.float16,\n    attn_implementation=\"eager\",  # naive attention -- goblin should swap to flash_rocm\n    token=HF_TOKEN,\n)\n\n# LoRA \u2014 rank 16, attached to attention projections.\nlora_config = LoraConfig(\n    r=16,\n    lora_alpha=32,\n    target_modules=[\"q_proj\", \"v_proj\"],\n    lora_dropout=0.05,\n    bias=\"none\",\n    task_type=\"CAUSAL_LM\",\n)\nmodel = get_peft_model(model, lora_config)\n\ndataset = load_dataset(\"yahma/alpaca-cleaned\", split=\"train\")\n\n# Hand-rolled DataLoader so parse_config sees the dataloader kwargs explicitly.\ntrain_loader = DataLoader(\n    dataset,\n    batch_size=4,\n    num_workers=0,        # leaves the GPU starved during training -- data_wait waste\n    pin_memory=False,\n    prefetch_factor=2,\n    persistent_workers=False,\n)\n\ntraining_args = TrainingArguments(\n    output_dir=\"./out\",\n    per_device_train_batch_size=4,        # leaves HBM on the floor at 192 GB\n    gradient_accumulation_steps=8,\n    num_train_epochs=3,\n    learning_rate=2e-4,\n    warmup_steps=100,\n    fp16=True,                             # bf16 is the right call on CDNA3\n    optim=\"adamw_torch\",\n    logging_steps=10,\n    save_steps=500,\n    dataloader_num_workers=0,\n    dataloader_pin_memory=False,\n    gradient_checkpointing=False,\n    torch_compile=False,\n    report_to=\"none\",\n    push_to_hub=False,\n)\n\ntrainer = Trainer(\n    model=model,\n    args=training_args,\n    train_dataset=dataset,\n    tokenizer=tokenizer,\n)\n\nif __name__ == \"__main__\":\n    trainer.train()\n",
+          "redactions": [
+            "hf_token"
+          ]
+        },
+        "steps": 50
+      }
+    }
+  },
+  {
+    "type": "tool_result",
+    "data": {
+      "id": "tc-6",
+      "name": "benchmark",
+      "ok": true,
+      "result": {
+        "steps": 50,
+        "tokens_per_sec": 318.0,
+        "mfu_pct": 51.0,
+        "hbm_peak_gb": 168.0,
+        "hbm_avg_gb": 152.0,
+        "gpu_util_pct": 86.0,
+        "top_kernels": [
+          {
+            "name": "aten::matmul (bf16)",
+            "pct_time": 46.0
+          },
+          {
+            "name": "flash_attn_rocm_fwd",
+            "pct_time": 19.0
+          },
+          {
+            "name": "flash_attn_rocm_bwd",
+            "pct_time": 14.0
+          },
+          {
+            "name": "aten::layer_norm",
+            "pct_time": 7.0
+          },
+          {
+            "name": "aten::cross_entropy_loss",
+            "pct_time": 4.0
+          }
+        ],
+        "attention_kernel_loaded": "flash_rocm",
+        "waste_budget": {
+          "useful_gpu": 0.78,
+          "data_wait": 0.04,
+          "host_gap": 0.05,
+          "comm_excess": 0.0,
+          "memory_headroom": 0.04,
+          "precision_path": 0.02,
+          "kernel_shape": 0.03
+        },
+        "warnings": [],
+        "rocm_version": "6.1.0",
+        "pytorch_version": "2.3.0+rocm6.1",
+        "runner_kind": "fake"
+      }
+    }
+  },
+  {
+    "type": "tool_call",
+    "data": {
+      "id": "tc-7",
+      "name": "compare_runs",
+      "input": {
+        "workload_name": "Llama-3-8B LoRA fine-tune",
+        "before": {
+          "steps": 50,
+          "tokens_per_sec": 142.0,
+          "mfu_pct": 24.0,
+          "hbm_peak_gb": 73.0,
+          "hbm_avg_gb": 61.0,
+          "gpu_util_pct": 46.0,
+          "top_kernels": [
+            {
+              "name": "aten::matmul (fp16)",
+              "pct_time": 38.0
+            },
+            {
+              "name": "aten::scaled_dot_product_attention (eager)",
+              "pct_time": 24.0
+            },
+            {
+              "name": "aten::layer_norm",
+              "pct_time": 8.0
+            },
+            {
+              "name": "aten::cross_entropy_loss",
+              "pct_time": 5.0
+            },
+            {
+              "name": "aten::copy_ (h2d)",
+              "pct_time": 11.0
+            }
+          ],
+          "attention_kernel_loaded": "eager",
+          "waste_budget": {
+            "useful_gpu": 0.42,
+            "data_wait": 0.21,
+            "host_gap": 0.06,
+            "comm_excess": 0.0,
+            "memory_headroom": 0.14,
+            "precision_path": 0.11,
+            "kernel_shape": 0.06
+          },
+          "warnings": [
+            "Attention kernel is 'eager'; flash_rocm or sdpa would be much faster.",
+            "HBM utilization 38% suggests batch_size is leaving memory on the floor."
+          ],
+          "rocm_version": "6.1.0",
+          "pytorch_version": "2.3.0+rocm6.1",
+          "runner_kind": "fake"
+        },
+        "after": {
+          "steps": 50,
+          "tokens_per_sec": 318.0,
+          "mfu_pct": 51.0,
+          "hbm_peak_gb": 168.0,
+          "hbm_avg_gb": 152.0,
+          "gpu_util_pct": 86.0,
+          "top_kernels": [
+            {
+              "name": "aten::matmul (bf16)",
+              "pct_time": 46.0
+            },
+            {
+              "name": "flash_attn_rocm_fwd",
+              "pct_time": 19.0
+            },
+            {
+              "name": "flash_attn_rocm_bwd",
+              "pct_time": 14.0
+            },
+            {
+              "name": "aten::layer_norm",
+              "pct_time": 7.0
+            },
+            {
+              "name": "aten::cross_entropy_loss",
+              "pct_time": 4.0
+            }
+          ],
+          "attention_kernel_loaded": "flash_rocm",
+          "waste_budget": {
+            "useful_gpu": 0.78,
+            "data_wait": 0.04,
+            "host_gap": 0.05,
+            "comm_excess": 0.0,
+            "memory_headroom": 0.04,
+            "precision_path": 0.02,
+            "kernel_shape": 0.03
+          },
+          "warnings": [],
+          "rocm_version": "6.1.0",
+          "pytorch_version": "2.3.0+rocm6.1",
+          "runner_kind": "fake"
+        },
+        "patch": {
+          "new_config": {
+            "model_name": "meta-llama/Meta-Llama-3-8B",
+            "batch_size": 4,
+            "grad_accum_steps": 8,
+            "seq_len": 1024,
+            "precision": "bf16",
+            "optimizer": "adamw_torch",
+            "attention_impl": "flash_rocm",
+            "gradient_checkpointing": false,
+            "lora_rank": 16,
+            "dataloader_workers": 0,
+            "dataloader_pin_memory": false,
+            "dataloader_prefetch_factor": 2,
+            "dataloader_persistent_workers": false,
+            "torch_compile": false,
+            "lr": 0.0002,
+            "warmup_steps": 100,
+            "env_vars": {
+              "HF_TOKEN": "hf_aaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "HSA_FORCE_FINE_GRAIN_PCIE": "1",
+              "MIOPEN_FIND_MODE": "3"
+            },
+            "extras": {
+              "lora.lora_alpha": 32,
+              "lora.target_modules": [
+                "q_proj",
+                "v_proj"
+              ],
+              "lora.lora_dropout": 0.05,
+              "lora.bias": "none",
+              "lora.task_type": "CAUSAL_LM",
+              "batch_size": 4,
+              "output_dir": "./out",
+              "num_train_epochs": 3,
+              "logging_steps": 10,
+              "save_steps": 500,
+              "report_to": "none",
+              "push_to_hub": false
+            },
+            "raw_source": "# GPU Goblin canonical demo workload.\n#\n# Llama-3-8B + LoRA fine-tune on the alpaca-cleaned dataset, staged with\n# *deliberately* sub-optimal defaults so the goblin has something to fix in\n# the demo. This script does NOT need to actually execute on a host \u2014 it\n# exists so `parse_config` can extract a realistic WorkloadConfig from it.\n#\n# Expected findings when audited:\n#   - precision.bf16_over_fp16_on_mi300x   (fp16=True)\n#   - attention.flash_rocm_over_eager      (attn_implementation=\"eager\")\n#   - data.dataloader_workers_zero         (dataloader_num_workers=0)\n#   - memory.batch_too_small_for_192gb     (per_device_train_batch_size=4)\n\nimport os\n\nimport torch\nfrom datasets import load_dataset\nfrom peft import LoraConfig, get_peft_model\nfrom torch.utils.data import DataLoader\nfrom transformers import (\n    AutoModelForCausalLM,\n    AutoTokenizer,\n    Trainer,\n    TrainingArguments,\n)\n\n# A redactable secret so parse_config has something to scrub during the demo.\nos.environ[\"HF_TOKEN\"] = \"<REDACTED:hf_token>\"\nHF_TOKEN = os.environ[\"HF_TOKEN\"]\n\n# ROCm-flavored env knobs the agent should pick up into env_vars.\nos.environ[\"HSA_FORCE_FINE_GRAIN_PCIE\"] = \"1\"\nos.environ[\"MIOPEN_FIND_MODE\"] = \"3\"\n\nMODEL_ID = \"meta-llama/Meta-Llama-3-8B\"\n\ntokenizer = AutoTokenizer.from_pretrained(MODEL_ID, token=HF_TOKEN)\nmodel = AutoModelForCausalLM.from_pretrained(\n    MODEL_ID,\n    torch_dtype=torch.float16,\n    attn_implementation=\"eager\",  # naive attention -- goblin should swap to flash_rocm\n    token=HF_TOKEN,\n)\n\n# LoRA \u2014 rank 16, attached to attention projections.\nlora_config = LoraConfig(\n    r=16,\n    lora_alpha=32,\n    target_modules=[\"q_proj\", \"v_proj\"],\n    lora_dropout=0.05,\n    bias=\"none\",\n    task_type=\"CAUSAL_LM\",\n)\nmodel = get_peft_model(model, lora_config)\n\ndataset = load_dataset(\"yahma/alpaca-cleaned\", split=\"train\")\n\n# Hand-rolled DataLoader so parse_config sees the dataloader kwargs explicitly.\ntrain_loader = DataLoader(\n    dataset,\n    batch_size=4,\n    num_workers=0,        # leaves the GPU starved during training -- data_wait waste\n    pin_memory=False,\n    prefetch_factor=2,\n    persistent_workers=False,\n)\n\ntraining_args = TrainingArguments(\n    output_dir=\"./out\",\n    per_device_train_batch_size=4,        # leaves HBM on the floor at 192 GB\n    gradient_accumulation_steps=8,\n    num_train_epochs=3,\n    learning_rate=2e-4,\n    warmup_steps=100,\n    fp16=True,                             # bf16 is the right call on CDNA3\n    optim=\"adamw_torch\",\n    logging_steps=10,\n    save_steps=500,\n    dataloader_num_workers=0,\n    dataloader_pin_memory=False,\n    gradient_checkpointing=False,\n    torch_compile=False,\n    report_to=\"none\",\n    push_to_hub=False,\n)\n\ntrainer = Trainer(\n    model=model,\n    args=training_args,\n    train_dataset=dataset,\n    tokenizer=tokenizer,\n)\n\nif __name__ == \"__main__\":\n    trainer.train()\n",
+            "redactions": [
+              "hf_token"
+            ]
+          },
+          "diff": "- attention_impl: 'eager'\n+ attention_impl: 'flash_rocm'\n- precision: 'fp16'\n+ precision: 'bf16'",
+          "rationale": [
+            {
+              "rule_id": "precision.bf16_over_fp16_on_mi300x",
+              "rationale": "MI300X CDNA3 matrix cores execute bf16 at the same throughput as fp16 with strictly better numerical stability. Reduces NaN risk in long runs.",
+              "citation": "ROCm MI300X Optimization Guide \u00a73.2 \u2014 bf16 vs fp16",
+              "targets_bucket": "precision_path",
+              "estimated_recovery_seconds": 0.0935
+            },
+            {
+              "rule_id": "attention.flash_rocm_over_eager",
+              "rationale": "Use the ROCm-validated flash-attention kernel (via Optimum-AMD or PyTorch SDPA backend). Eliminates O(seq_len^2) attention memory; typically 2-3x faster on MI300X for seq_len >= 1024.",
+              "citation": "AMD ROCm vLLM/Optimum-AMD docs \u2014 Flash Attention validated on MI300",
+              "targets_bucket": "kernel_shape",
+              "estimated_recovery_seconds": 0.041999999999999996
+            }
+          ],
+          "expected_speedup_low": 1.04,
+          "expected_speedup_high": 1.31,
+          "confidence": 0.85
+        }
+      }
+    }
+  },
+  {
+    "type": "tool_result",
+    "data": {
+      "id": "tc-7",
+      "name": "compare_runs",
+      "ok": true,
+      "result": {
+        "workload_name": "Llama-3-8B LoRA fine-tune",
+        "before": {
+          "steps": 50,
+          "tokens_per_sec": 142.0,
+          "mfu_pct": 24.0,
+          "hbm_peak_gb": 73.0,
+          "hbm_avg_gb": 61.0,
+          "gpu_util_pct": 46.0,
+          "top_kernels": [
+            {
+              "name": "aten::matmul (fp16)",
+              "pct_time": 38.0
+            },
+            {
+              "name": "aten::scaled_dot_product_attention (eager)",
+              "pct_time": 24.0
+            },
+            {
+              "name": "aten::layer_norm",
+              "pct_time": 8.0
+            },
+            {
+              "name": "aten::cross_entropy_loss",
+              "pct_time": 5.0
+            },
+            {
+              "name": "aten::copy_ (h2d)",
+              "pct_time": 11.0
+            }
+          ],
+          "attention_kernel_loaded": "eager",
+          "waste_budget": {
+            "useful_gpu": 0.42,
+            "data_wait": 0.21,
+            "host_gap": 0.06,
+            "comm_excess": 0.0,
+            "memory_headroom": 0.14,
+            "precision_path": 0.11,
+            "kernel_shape": 0.06
+          },
+          "warnings": [
+            "Attention kernel is 'eager'; flash_rocm or sdpa would be much faster.",
+            "HBM utilization 38% suggests batch_size is leaving memory on the floor."
+          ],
+          "rocm_version": "6.1.0",
+          "pytorch_version": "2.3.0+rocm6.1",
+          "runner_kind": "fake"
+        },
+        "after": {
+          "steps": 50,
+          "tokens_per_sec": 318.0,
+          "mfu_pct": 51.0,
+          "hbm_peak_gb": 168.0,
+          "hbm_avg_gb": 152.0,
+          "gpu_util_pct": 86.0,
+          "top_kernels": [
+            {
+              "name": "aten::matmul (bf16)",
+              "pct_time": 46.0
+            },
+            {
+              "name": "flash_attn_rocm_fwd",
+              "pct_time": 19.0
+            },
+            {
+              "name": "flash_attn_rocm_bwd",
+              "pct_time": 14.0
+            },
+            {
+              "name": "aten::layer_norm",
+              "pct_time": 7.0
+            },
+            {
+              "name": "aten::cross_entropy_loss",
+              "pct_time": 4.0
+            }
+          ],
+          "attention_kernel_loaded": "flash_rocm",
+          "waste_budget": {
+            "useful_gpu": 0.78,
+            "data_wait": 0.04,
+            "host_gap": 0.05,
+            "comm_excess": 0.0,
+            "memory_headroom": 0.04,
+            "precision_path": 0.02,
+            "kernel_shape": 0.03
+          },
+          "warnings": [],
+          "rocm_version": "6.1.0",
+          "pytorch_version": "2.3.0+rocm6.1",
+          "runner_kind": "fake"
+        },
+        "patch": {
+          "new_config": {
+            "model_name": "meta-llama/Meta-Llama-3-8B",
+            "batch_size": 4,
+            "grad_accum_steps": 8,
+            "seq_len": 1024,
+            "precision": "bf16",
+            "optimizer": "adamw_torch",
+            "attention_impl": "flash_rocm",
+            "gradient_checkpointing": false,
+            "lora_rank": 16,
+            "dataloader_workers": 0,
+            "dataloader_pin_memory": false,
+            "dataloader_prefetch_factor": 2,
+            "dataloader_persistent_workers": false,
+            "torch_compile": false,
+            "lr": 0.0002,
+            "warmup_steps": 100,
+            "env_vars": {
+              "HF_TOKEN": "hf_aaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "HSA_FORCE_FINE_GRAIN_PCIE": "1",
+              "MIOPEN_FIND_MODE": "3"
+            },
+            "extras": {
+              "lora.lora_alpha": 32,
+              "lora.target_modules": [
+                "q_proj",
+                "v_proj"
+              ],
+              "lora.lora_dropout": 0.05,
+              "lora.bias": "none",
+              "lora.task_type": "CAUSAL_LM",
+              "batch_size": 4,
+              "output_dir": "./out",
+              "num_train_epochs": 3,
+              "logging_steps": 10,
+              "save_steps": 500,
+              "report_to": "none",
+              "push_to_hub": false
+            },
+            "raw_source": "# GPU Goblin canonical demo workload.\n#\n# Llama-3-8B + LoRA fine-tune on the alpaca-cleaned dataset, staged with\n# *deliberately* sub-optimal defaults so the goblin has something to fix in\n# the demo. This script does NOT need to actually execute on a host \u2014 it\n# exists so `parse_config` can extract a realistic WorkloadConfig from it.\n#\n# Expected findings when audited:\n#   - precision.bf16_over_fp16_on_mi300x   (fp16=True)\n#   - attention.flash_rocm_over_eager      (attn_implementation=\"eager\")\n#   - data.dataloader_workers_zero         (dataloader_num_workers=0)\n#   - memory.batch_too_small_for_192gb     (per_device_train_batch_size=4)\n\nimport os\n\nimport torch\nfrom datasets import load_dataset\nfrom peft import LoraConfig, get_peft_model\nfrom torch.utils.data import DataLoader\nfrom transformers import (\n    AutoModelForCausalLM,\n    AutoTokenizer,\n    Trainer,\n    TrainingArguments,\n)\n\n# A redactable secret so parse_config has something to scrub during the demo.\nos.environ[\"HF_TOKEN\"] = \"<REDACTED:hf_token>\"\nHF_TOKEN = os.environ[\"HF_TOKEN\"]\n\n# ROCm-flavored env knobs the agent should pick up into env_vars.\nos.environ[\"HSA_FORCE_FINE_GRAIN_PCIE\"] = \"1\"\nos.environ[\"MIOPEN_FIND_MODE\"] = \"3\"\n\nMODEL_ID = \"meta-llama/Meta-Llama-3-8B\"\n\ntokenizer = AutoTokenizer.from_pretrained(MODEL_ID, token=HF_TOKEN)\nmodel = AutoModelForCausalLM.from_pretrained(\n    MODEL_ID,\n    torch_dtype=torch.float16,\n    attn_implementation=\"eager\",  # naive attention -- goblin should swap to flash_rocm\n    token=HF_TOKEN,\n)\n\n# LoRA \u2014 rank 16, attached to attention projections.\nlora_config = LoraConfig(\n    r=16,\n    lora_alpha=32,\n    target_modules=[\"q_proj\", \"v_proj\"],\n    lora_dropout=0.05,\n    bias=\"none\",\n    task_type=\"CAUSAL_LM\",\n)\nmodel = get_peft_model(model, lora_config)\n\ndataset = load_dataset(\"yahma/alpaca-cleaned\", split=\"train\")\n\n# Hand-rolled DataLoader so parse_config sees the dataloader kwargs explicitly.\ntrain_loader = DataLoader(\n    dataset,\n    batch_size=4,\n    num_workers=0,        # leaves the GPU starved during training -- data_wait waste\n    pin_memory=False,\n    prefetch_factor=2,\n    persistent_workers=False,\n)\n\ntraining_args = TrainingArguments(\n    output_dir=\"./out\",\n    per_device_train_batch_size=4,        # leaves HBM on the floor at 192 GB\n    gradient_accumulation_steps=8,\n    num_train_epochs=3,\n    learning_rate=2e-4,\n    warmup_steps=100,\n    fp16=True,                             # bf16 is the right call on CDNA3\n    optim=\"adamw_torch\",\n    logging_steps=10,\n    save_steps=500,\n    dataloader_num_workers=0,\n    dataloader_pin_memory=False,\n    gradient_checkpointing=False,\n    torch_compile=False,\n    report_to=\"none\",\n    push_to_hub=False,\n)\n\ntrainer = Trainer(\n    model=model,\n    args=training_args,\n    train_dataset=dataset,\n    tokenizer=tokenizer,\n)\n\nif __name__ == \"__main__\":\n    trainer.train()\n",
+            "redactions": [
+              "hf_token"
+            ]
+          },
+          "diff": "- attention_impl: 'eager'\n+ attention_impl: 'flash_rocm'\n- precision: 'fp16'\n+ precision: 'bf16'",
+          "rationale": [
+            {
+              "rule_id": "precision.bf16_over_fp16_on_mi300x",
+              "rationale": "MI300X CDNA3 matrix cores execute bf16 at the same throughput as fp16 with strictly better numerical stability. Reduces NaN risk in long runs.",
+              "citation": "ROCm MI300X Optimization Guide \u00a73.2 \u2014 bf16 vs fp16",
+              "targets_bucket": "precision_path",
+              "estimated_recovery_seconds": 0.0935
+            },
+            {
+              "rule_id": "attention.flash_rocm_over_eager",
+              "rationale": "Use the ROCm-validated flash-attention kernel (via Optimum-AMD or PyTorch SDPA backend). Eliminates O(seq_len^2) attention memory; typically 2-3x faster on MI300X for seq_len >= 1024.",
+              "citation": "AMD ROCm vLLM/Optimum-AMD docs \u2014 Flash Attention validated on MI300",
+              "targets_bucket": "kernel_shape",
+              "estimated_recovery_seconds": 0.041999999999999996
+            }
+          ],
+          "expected_speedup_low": 1.04,
+          "expected_speedup_high": 1.31,
+          "confidence": 0.85
+        },
+        "metric_deltas": [
+          {
+            "name": "tokens_per_sec",
+            "before": 142.0,
+            "after": 318.0,
+            "unit": "tok/s"
+          },
+          {
+            "name": "mfu_pct",
+            "before": 24.0,
+            "after": 51.0,
+            "unit": "%"
+          },
+          {
+            "name": "hbm_peak_gb",
+            "before": 73.0,
+            "after": 168.0,
+            "unit": "GB"
+          },
+          {
+            "name": "gpu_util_pct",
+            "before": 46.0,
+            "after": 86.0,
+            "unit": "%"
+          }
+        ],
+        "waste_budget_before": {
+          "useful_gpu": 0.42,
+          "data_wait": 0.21,
+          "host_gap": 0.06,
+          "comm_excess": 0.0,
+          "memory_headroom": 0.14,
+          "precision_path": 0.11,
+          "kernel_shape": 0.06
+        },
+        "waste_budget_after": {
+          "useful_gpu": 0.78,
+          "data_wait": 0.04,
+          "host_gap": 0.05,
+          "comm_excess": 0.0,
+          "memory_headroom": 0.04,
+          "precision_path": 0.02,
+          "kernel_shape": 0.03
+        },
+        "speedup_actual": 2.24,
+        "speedup_predicted_low": 1.04,
+        "speedup_predicted_high": 1.31,
+        "confidence": 0.85,
+        "summary_line": "Tokens/sec: 142 \u2192 318 (2.24\u00d7). MFU: 24% \u2192 51%.",
+        "validity_footer": "Recommendations validated against MI300X with the observed ROCm and PyTorch versions. Re-run the audit if you change model, hardware, or framework version."
+      }
+    }
+  },
+  {
+    "type": "final_report",
+    "data": {
+      "report": {
+        "workload_name": "Llama-3-8B LoRA fine-tune",
+        "before": {
+          "steps": 50,
+          "tokens_per_sec": 142.0,
+          "mfu_pct": 24.0,
+          "hbm_peak_gb": 73.0,
+          "hbm_avg_gb": 61.0,
+          "gpu_util_pct": 46.0,
+          "top_kernels": [
+            {
+              "name": "aten::matmul (fp16)",
+              "pct_time": 38.0
+            },
+            {
+              "name": "aten::scaled_dot_product_attention (eager)",
+              "pct_time": 24.0
+            },
+            {
+              "name": "aten::layer_norm",
+              "pct_time": 8.0
+            },
+            {
+              "name": "aten::cross_entropy_loss",
+              "pct_time": 5.0
+            },
+            {
+              "name": "aten::copy_ (h2d)",
+              "pct_time": 11.0
+            }
+          ],
+          "attention_kernel_loaded": "eager",
+          "waste_budget": {
+            "useful_gpu": 0.42,
+            "data_wait": 0.21,
+            "host_gap": 0.06,
+            "comm_excess": 0.0,
+            "memory_headroom": 0.14,
+            "precision_path": 0.11,
+            "kernel_shape": 0.06
+          },
+          "warnings": [
+            "Attention kernel is 'eager'; flash_rocm or sdpa would be much faster.",
+            "HBM utilization 38% suggests batch_size is leaving memory on the floor."
+          ],
+          "rocm_version": "6.1.0",
+          "pytorch_version": "2.3.0+rocm6.1",
+          "runner_kind": "fake"
+        },
+        "after": {
+          "steps": 50,
+          "tokens_per_sec": 318.0,
+          "mfu_pct": 51.0,
+          "hbm_peak_gb": 168.0,
+          "hbm_avg_gb": 152.0,
+          "gpu_util_pct": 86.0,
+          "top_kernels": [
+            {
+              "name": "aten::matmul (bf16)",
+              "pct_time": 46.0
+            },
+            {
+              "name": "flash_attn_rocm_fwd",
+              "pct_time": 19.0
+            },
+            {
+              "name": "flash_attn_rocm_bwd",
+              "pct_time": 14.0
+            },
+            {
+              "name": "aten::layer_norm",
+              "pct_time": 7.0
+            },
+            {
+              "name": "aten::cross_entropy_loss",
+              "pct_time": 4.0
+            }
+          ],
+          "attention_kernel_loaded": "flash_rocm",
+          "waste_budget": {
+            "useful_gpu": 0.78,
+            "data_wait": 0.04,
+            "host_gap": 0.05,
+            "comm_excess": 0.0,
+            "memory_headroom": 0.04,
+            "precision_path": 0.02,
+            "kernel_shape": 0.03
+          },
+          "warnings": [],
+          "rocm_version": "6.1.0",
+          "pytorch_version": "2.3.0+rocm6.1",
+          "runner_kind": "fake"
+        },
+        "patch": {
+          "new_config": {
+            "model_name": "meta-llama/Meta-Llama-3-8B",
+            "batch_size": 4,
+            "grad_accum_steps": 8,
+            "seq_len": 1024,
+            "precision": "bf16",
+            "optimizer": "adamw_torch",
+            "attention_impl": "flash_rocm",
+            "gradient_checkpointing": false,
+            "lora_rank": 16,
+            "dataloader_workers": 0,
+            "dataloader_pin_memory": false,
+            "dataloader_prefetch_factor": 2,
+            "dataloader_persistent_workers": false,
+            "torch_compile": false,
+            "lr": 0.0002,
+            "warmup_steps": 100,
+            "env_vars": {
+              "HF_TOKEN": "hf_aaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "HSA_FORCE_FINE_GRAIN_PCIE": "1",
+              "MIOPEN_FIND_MODE": "3"
+            },
+            "extras": {
+              "lora.lora_alpha": 32,
+              "lora.target_modules": [
+                "q_proj",
+                "v_proj"
+              ],
+              "lora.lora_dropout": 0.05,
+              "lora.bias": "none",
+              "lora.task_type": "CAUSAL_LM",
+              "batch_size": 4,
+              "output_dir": "./out",
+              "num_train_epochs": 3,
+              "logging_steps": 10,
+              "save_steps": 500,
+              "report_to": "none",
+              "push_to_hub": false
+            },
+            "raw_source": "# GPU Goblin canonical demo workload.\n#\n# Llama-3-8B + LoRA fine-tune on the alpaca-cleaned dataset, staged with\n# *deliberately* sub-optimal defaults so the goblin has something to fix in\n# the demo. This script does NOT need to actually execute on a host \u2014 it\n# exists so `parse_config` can extract a realistic WorkloadConfig from it.\n#\n# Expected findings when audited:\n#   - precision.bf16_over_fp16_on_mi300x   (fp16=True)\n#   - attention.flash_rocm_over_eager      (attn_implementation=\"eager\")\n#   - data.dataloader_workers_zero         (dataloader_num_workers=0)\n#   - memory.batch_too_small_for_192gb     (per_device_train_batch_size=4)\n\nimport os\n\nimport torch\nfrom datasets import load_dataset\nfrom peft import LoraConfig, get_peft_model\nfrom torch.utils.data import DataLoader\nfrom transformers import (\n    AutoModelForCausalLM,\n    AutoTokenizer,\n    Trainer,\n    TrainingArguments,\n)\n\n# A redactable secret so parse_config has something to scrub during the demo.\nos.environ[\"HF_TOKEN\"] = \"<REDACTED:hf_token>\"\nHF_TOKEN = os.environ[\"HF_TOKEN\"]\n\n# ROCm-flavored env knobs the agent should pick up into env_vars.\nos.environ[\"HSA_FORCE_FINE_GRAIN_PCIE\"] = \"1\"\nos.environ[\"MIOPEN_FIND_MODE\"] = \"3\"\n\nMODEL_ID = \"meta-llama/Meta-Llama-3-8B\"\n\ntokenizer = AutoTokenizer.from_pretrained(MODEL_ID, token=HF_TOKEN)\nmodel = AutoModelForCausalLM.from_pretrained(\n    MODEL_ID,\n    torch_dtype=torch.float16,\n    attn_implementation=\"eager\",  # naive attention -- goblin should swap to flash_rocm\n    token=HF_TOKEN,\n)\n\n# LoRA \u2014 rank 16, attached to attention projections.\nlora_config = LoraConfig(\n    r=16,\n    lora_alpha=32,\n    target_modules=[\"q_proj\", \"v_proj\"],\n    lora_dropout=0.05,\n    bias=\"none\",\n    task_type=\"CAUSAL_LM\",\n)\nmodel = get_peft_model(model, lora_config)\n\ndataset = load_dataset(\"yahma/alpaca-cleaned\", split=\"train\")\n\n# Hand-rolled DataLoader so parse_config sees the dataloader kwargs explicitly.\ntrain_loader = DataLoader(\n    dataset,\n    batch_size=4,\n    num_workers=0,        # leaves the GPU starved during training -- data_wait waste\n    pin_memory=False,\n    prefetch_factor=2,\n    persistent_workers=False,\n)\n\ntraining_args = TrainingArguments(\n    output_dir=\"./out\",\n    per_device_train_batch_size=4,        # leaves HBM on the floor at 192 GB\n    gradient_accumulation_steps=8,\n    num_train_epochs=3,\n    learning_rate=2e-4,\n    warmup_steps=100,\n    fp16=True,                             # bf16 is the right call on CDNA3\n    optim=\"adamw_torch\",\n    logging_steps=10,\n    save_steps=500,\n    dataloader_num_workers=0,\n    dataloader_pin_memory=False,\n    gradient_checkpointing=False,\n    torch_compile=False,\n    report_to=\"none\",\n    push_to_hub=False,\n)\n\ntrainer = Trainer(\n    model=model,\n    args=training_args,\n    train_dataset=dataset,\n    tokenizer=tokenizer,\n)\n\nif __name__ == \"__main__\":\n    trainer.train()\n",
+            "redactions": [
+              "hf_token"
+            ]
+          },
+          "diff": "- attention_impl: 'eager'\n+ attention_impl: 'flash_rocm'\n- precision: 'fp16'\n+ precision: 'bf16'",
+          "rationale": [
+            {
+              "rule_id": "precision.bf16_over_fp16_on_mi300x",
+              "rationale": "MI300X CDNA3 matrix cores execute bf16 at the same throughput as fp16 with strictly better numerical stability. Reduces NaN risk in long runs.",
+              "citation": "ROCm MI300X Optimization Guide \u00a73.2 \u2014 bf16 vs fp16",
+              "targets_bucket": "precision_path",
+              "estimated_recovery_seconds": 0.0935
+            },
+            {
+              "rule_id": "attention.flash_rocm_over_eager",
+              "rationale": "Use the ROCm-validated flash-attention kernel (via Optimum-AMD or PyTorch SDPA backend). Eliminates O(seq_len^2) attention memory; typically 2-3x faster on MI300X for seq_len >= 1024.",
+              "citation": "AMD ROCm vLLM/Optimum-AMD docs \u2014 Flash Attention validated on MI300",
+              "targets_bucket": "kernel_shape",
+              "estimated_recovery_seconds": 0.041999999999999996
+            }
+          ],
+          "expected_speedup_low": 1.04,
+          "expected_speedup_high": 1.31,
+          "confidence": 0.85
+        },
+        "metric_deltas": [
+          {
+            "name": "tokens_per_sec",
+            "before": 142.0,
+            "after": 318.0,
+            "unit": "tok/s"
+          },
+          {
+            "name": "mfu_pct",
+            "before": 24.0,
+            "after": 51.0,
+            "unit": "%"
+          },
+          {
+            "name": "hbm_peak_gb",
+            "before": 73.0,
+            "after": 168.0,
+            "unit": "GB"
+          },
+          {
+            "name": "gpu_util_pct",
+            "before": 46.0,
+            "after": 86.0,
+            "unit": "%"
+          }
+        ],
+        "waste_budget_before": {
+          "useful_gpu": 0.42,
+          "data_wait": 0.21,
+          "host_gap": 0.06,
+          "comm_excess": 0.0,
+          "memory_headroom": 0.14,
+          "precision_path": 0.11,
+          "kernel_shape": 0.06
+        },
+        "waste_budget_after": {
+          "useful_gpu": 0.78,
+          "data_wait": 0.04,
+          "host_gap": 0.05,
+          "comm_excess": 0.0,
+          "memory_headroom": 0.04,
+          "precision_path": 0.02,
+          "kernel_shape": 0.03
+        },
+        "speedup_actual": 2.24,
+        "speedup_predicted_low": 1.04,
+        "speedup_predicted_high": 1.31,
+        "confidence": 0.85,
+        "summary_line": "Tokens/sec: 142 \u2192 318 (2.24\u00d7). MFU: 24% \u2192 51%.",
+        "validity_footer": "Recommendations validated against MI300X with the observed ROCm and PyTorch versions. Re-run the audit if you change model, hardware, or framework version."
+      }
+    }
+  }
+]

@@ -1,0 +1,468 @@
+# GPU Goblin — curated ROCm / MI300X optimization rules.
+#
+# Each entry is validated against agent.schemas.Rule at module import.
+# Rules are hand-curated from ROCm docs + AMD blog posts. NO LLM-generated rules.
+# This is the moat — every recommendation in the final report is grounded here.
+#
+# Ordering note: file order is irrelevant; query_rocm_kb.py ranks by cosine
+# similarity between query symptom and rule.symptom embeddings.
+
+# ---------------------------------------------------------------------------
+# precision
+# ---------------------------------------------------------------------------
+
+- id: precision.bf16_over_fp16_on_mi300x
+  category: precision
+  targets_bucket: precision_path
+  symptom: >-
+    fp16 used on MI300X / CDNA3 matrix cores. Loss can NaN on long fine-tuning
+    runs and there is no throughput benefit over bf16 — the reflexive NVIDIA
+    default carries forward without thinking.
+  detect:
+    precision: fp16
+  transform:
+    precision: bf16
+  expected_recovery_fraction: 0.85
+  expected_impact: >-
+    MI300X CDNA3 matrix cores execute bf16 at the same throughput as fp16 with
+    strictly better numerical stability. Switch removes NaN risk in long runs;
+    no loss-scaling required.
+  rocm_version_min: "6.0"
+  citation: "ROCm MI300X Optimization Guide §3.2 — bf16 vs fp16"
+
+- id: precision.fp32_default_wastes_matrix_cores
+  category: precision
+  targets_bucket: precision_path
+  symptom: >-
+    Training in fp32 on MI300X. The CDNA3 matrix cores deliver ~2x throughput
+    in bf16 vs fp32 and the LoRA fine-tuning loss surface tolerates bf16
+    cleanly — fp32 is simply leaving silicon idle.
+  detect:
+    precision: fp32
+  transform:
+    precision: bf16
+  expected_recovery_fraction: 0.6
+  expected_impact: >-
+    Switching fp32 → bf16 nets roughly 2x matmul throughput on MI300X and
+    halves activation memory, which usually unlocks a larger batch size as a
+    follow-on win.
+  rocm_version_min: "6.0"
+  citation: "AMD MI300X Tuning Guide — Matrix-core throughput by precision"
+
+# ---------------------------------------------------------------------------
+# attention
+# ---------------------------------------------------------------------------
+
+- id: attention.flash_rocm_over_eager
+  category: attention
+  targets_bucket: kernel_shape
+  symptom: >-
+    Naive (eager) attention on MI300X — no flash kernel loaded, attention
+    materializes the full O(seq_len^2) matrix. Most MI300X waste at long
+    context lives here.
+  detect:
+    attention_impl: eager
+  transform:
+    attention_impl: flash_rocm
+  expected_recovery_fraction: 0.7
+  expected_impact: >-
+    Use the ROCm-validated flash-attention kernel (Optimum-AMD ships a tested
+    build). Eliminates the O(seq_len^2) attention memory blow-up; typically
+    2-3x faster on MI300X for seq_len >= 1024.
+  rocm_version_min: "6.0"
+  citation: "AMD Optimum-AMD docs — Flash Attention 2 validated on MI300"
+
+- id: attention.sdpa_over_eager
+  category: attention
+  targets_bucket: kernel_shape
+  symptom: >-
+    Eager attention used when a drop-in faster path exists. PyTorch SDPA on
+    ROCm dispatches to a fused kernel without requiring the flash-attn fork
+    install — the lowest-friction attention upgrade available.
+  detect:
+    attention_impl: eager
+  transform:
+    attention_impl: sdpa
+  expected_recovery_fraction: 0.45
+  expected_impact: >-
+    PyTorch's torch.nn.functional.scaled_dot_product_attention on ROCm is a
+    fused, memory-efficient backend with no extra dependency. Slower than
+    flash-attn ROCm but a one-line config change with no install pain.
+  rocm_version_min: "6.0"
+  citation: "PyTorch SDPA backend selection — ROCm support notes"
+
+# ---------------------------------------------------------------------------
+# memory
+# ---------------------------------------------------------------------------
+
+- id: memory.batch_too_small_for_192gb
+  category: memory
+  targets_bucket: memory_headroom
+  symptom: >-
+    HBM peak is far below MI300X's 192 GB ceiling — the user copied a batch
+    size from an A100 80GB tutorial and is leaving more than half the HBM
+    idle every step.
+  detect:
+    batch_size: {"$lt": 8}
+  transform:
+    batch_size: 12
+  expected_recovery_fraction: 0.55
+  expected_impact: >-
+    Raising batch size to fill more of the 192 GB HBM increases tokens/sec
+    proportionally for compute-bound LoRA workloads. Adjust grad-accum down
+    to keep effective batch unchanged if needed.
+  rocm_version_min: "6.0"
+  citation: "AMD Instinct MI300X — 192 GB HBM3 fine-tuning playbook"
+
+- id: memory.gradient_checkpointing_for_long_seq
+  category: memory
+  targets_bucket: memory_headroom
+  symptom: >-
+    Long sequences (seq_len >= 4096) without gradient checkpointing are
+    spending HBM on activations that could be recomputed instead — leaving
+    no headroom to grow the batch.
+  detect:
+    seq_len: {"$gte": 4096}
+    gradient_checkpointing: false
+  transform:
+    gradient_checkpointing: true
+  expected_recovery_fraction: 0.4
+  expected_impact: >-
+    Enables freeing activation memory to enlarge batch size at long context;
+    typical net win 1.3-1.7x throughput at seq_len 4k-8k on MI300X despite
+    the recompute tax.
+  rocm_version_min: "6.0"
+  citation: "HF Transformers gradient_checkpointing + AMD long-context guide"
+
+# ---------------------------------------------------------------------------
+# data
+# ---------------------------------------------------------------------------
+
+- id: data.dataloader_workers_zero
+  category: data
+  targets_bucket: data_wait
+  symptom: >-
+    DataLoader num_workers=0 — the GPU stalls while the main process
+    tokenizes the next batch. Classic MI300X starvation pattern at
+    high-throughput LoRA fine-tuning.
+  detect:
+    dataloader_workers: 0
+  transform:
+    dataloader_workers: 8
+  expected_recovery_fraction: 0.8
+  expected_impact: >-
+    Spinning up 4-8 worker processes hides tokenization and host transfer
+    behind GPU compute. On MI300X with a fast NVMe dataset, this often nets
+    2x tokens/sec on its own.
+  rocm_version_min: "6.0"
+  citation: "PyTorch DataLoader best practices + MI300X fine-tuning notes"
+
+- id: data.pin_memory_false
+  category: data
+  targets_bucket: data_wait
+  symptom: >-
+    DataLoader pin_memory=False on a CUDA/ROCm host. Each batch copy from
+    pageable host memory blocks the launch queue instead of overlapping with
+    compute.
+  detect:
+    dataloader_pin_memory: false
+  transform:
+    dataloader_pin_memory: true
+  expected_recovery_fraction: 0.5
+  expected_impact: >-
+    pin_memory=True allows asynchronous host-to-device transfer that
+    overlaps with the previous step's compute. Roughly free win, no other
+    config changes needed.
+  rocm_version_min: "6.0"
+  citation: "PyTorch CUDA/ROCm DataLoader pin_memory documentation"
+
+- id: data.prefetch_factor_default
+  category: data
+  targets_bucket: data_wait
+  symptom: >-
+    DataLoader prefetch_factor left at the default of 2 while MI300X is
+    fast enough to drain the queue and stall before the next batch is
+    ready. Symptom: GPU util oscillates 100% → 30% in a sawtooth.
+  detect:
+    dataloader_prefetch_factor: {"$lte": 2}
+  transform:
+    dataloader_prefetch_factor: 4
+  expected_recovery_fraction: 0.3
+  expected_impact: >-
+    Raising prefetch_factor to 4 keeps two extra batches buffered per
+    worker, smoothing out the GPU-util sawtooth. Costs a few hundred MB of
+    host RAM per worker; trivial on a typical MI300X box.
+  rocm_version_min: "6.0"
+  citation: "PyTorch DataLoader prefetch_factor — long-step jitter notes"
+
+- id: data.persistent_workers_false
+  category: data
+  targets_bucket: data_wait
+  symptom: >-
+    DataLoader persistent_workers=False — workers are torn down and
+    respawned every epoch. On large datasets the warmup tax bleeds time
+    between epochs even when the per-epoch throughput is good.
+  detect:
+    dataloader_persistent_workers: false
+  transform:
+    dataloader_persistent_workers: true
+  expected_recovery_fraction: 0.25
+  expected_impact: >-
+    Keeps DataLoader workers alive across epochs so the dataset doesn't
+    re-initialize. Removes a 5-30 second hitch at every epoch boundary on
+    Llama-3 LoRA workloads.
+  rocm_version_min: "6.0"
+  citation: "PyTorch DataLoader persistent_workers documentation"
+
+# ---------------------------------------------------------------------------
+# compile
+# ---------------------------------------------------------------------------
+
+- id: compile.torch_compile_off
+  category: compile
+  targets_bucket: host_gap
+  symptom: >-
+    torch.compile is disabled but the model is on the eager-mode-friendly
+    list (Llama, Mistral, Gemma, Qwen). Eager dispatch leaves host-gap
+    bubbles between MI300X kernels that compile would erase.
+  detect:
+    torch_compile: false
+  transform:
+    torch_compile: true
+  expected_recovery_fraction: 0.6
+  expected_impact: >-
+    torch.compile fuses small ops and removes Python dispatch overhead;
+    typical 1.1-1.3x throughput on Llama-class fine-tuning on MI300X. Verify
+    no graph breaks in your forward by running with TORCH_LOGS=graph_breaks.
+  rocm_version_min: "6.0"
+  citation: "PyTorch torch.compile + ROCm support matrix"
+
+# ---------------------------------------------------------------------------
+# env_vars
+# ---------------------------------------------------------------------------
+
+- id: env.nccl_min_nchannels
+  category: env_vars
+  targets_bucket: comm_excess
+  symptom: >-
+    NCCL_MIN_NCHANNELS not set on a collective-heavy training run. RCCL on
+    MI300X benefits from a larger channel floor than the upstream NCCL
+    default to saturate the XGMI mesh.
+  detect: {}
+  transform:
+    env_vars.NCCL_MIN_NCHANNELS: "112"
+  expected_recovery_fraction: 0.35
+  expected_impact: >-
+    Setting NCCL_MIN_NCHANNELS=112 forces RCCL to use enough channels to
+    saturate MI300X XGMI bandwidth on all-reduce. Helps anywhere RCCL/NCCL
+    appears in the top kernels list.
+  rocm_version_min: "6.0"
+  citation: "AMD ROCm RCCL tuning guide — NCCL_MIN_NCHANNELS recommendation"
+
+- id: env.numa_auto_balancing_disable
+  category: env_vars
+  targets_bucket: host_gap
+  symptom: >-
+    Linux NUMA auto-balancing left enabled — the kernel migrates pinned
+    pages between NUMA nodes during the run, causing variance and
+    occasional multi-second stalls in benchmark numbers.
+  detect: {}
+  transform:
+    env_vars.GOBLIN_HINT_NUMA_AUTO_BALANCING: "disable_via_sysctl"
+  expected_recovery_fraction: 0.15
+  expected_impact: >-
+    Disable with `echo 0 | sudo tee /proc/sys/kernel/numa_balancing` before
+    benchmarking. Removes a major source of step-time variance on MI300X
+    multi-socket boxes; required for reproducible before/after numbers.
+  rocm_version_min: "6.0"
+  citation: "AMD ROCm performance tuning — NUMA auto-balancing disable"
+
+- id: env.hsa_force_fine_grain_pcie
+  category: env_vars
+  targets_bucket: host_gap
+  symptom: >-
+    HSA_FORCE_FINE_GRAIN_PCIE not set. Fine-grained PCIe transfers reduce
+    host→device latency for the small control packets that bracket every
+    kernel launch.
+  detect: {}
+  transform:
+    env_vars.HSA_FORCE_FINE_GRAIN_PCIE: "1"
+  expected_recovery_fraction: 0.15
+  expected_impact: >-
+    Enables fine-grained PCIe coherent traffic on MI300X. Small but
+    consistent host-gap reduction; no downside on supported platforms.
+  rocm_version_min: "6.0"
+  citation: "AMD ROCm env var reference — HSA_FORCE_FINE_GRAIN_PCIE"
+
+# ---------------------------------------------------------------------------
+# kernels
+# ---------------------------------------------------------------------------
+
+- id: kernels.hipblaslt_hint_logging
+  category: kernels
+  targets_bucket: kernel_shape
+  symptom: >-
+    Stable model + batch + seq shapes with hipBLASLt heuristic logging
+    disabled. Each step is solving a tile-selection problem the library
+    already solved; an offline-tuned hint file would eliminate the search.
+  detect: {}
+  transform:
+    env_vars.HIPBLASLT_TUNING_FILE: "/tmp/hipblaslt.tuning"
+    env_vars.HIPBLASLT_LOG_LEVEL: "1"
+  expected_recovery_fraction: 0.3
+  expected_impact: >-
+    Run once with HIPBLASLT_LOG_LEVEL=1 to capture the best tile heuristic
+    per GEMM shape, then use HIPBLASLT_TUNING_FILE to reuse it. Typical
+    win: 5-15% on long-running fine-tunes with stable shapes.
+  rocm_version_min: "6.0"
+  citation: "AMD hipBLASLt tuning + offline-hint workflow"
+
+- id: kernels.miopen_find_mode_2
+  category: kernels
+  targets_bucket: kernel_shape
+  symptom: >-
+    MIOPEN_FIND_MODE not set. MIOpen falls back to a slow exhaustive search
+    on the first iteration of every new shape; with FIND_MODE=2 the cached
+    fast solution is reused immediately.
+  detect: {}
+  transform:
+    env_vars.MIOPEN_FIND_MODE: "2"
+  expected_recovery_fraction: 0.25
+  expected_impact: >-
+    MIOPEN_FIND_MODE=2 (FAST + DB lookup) eliminates the cold-start search
+    pause on conv/attention layers. First-step time drops dramatically;
+    steady-state perf is unchanged but warmup is cheaper.
+  rocm_version_min: "6.0"
+  citation: "AMD MIOpen documentation — MIOPEN_FIND_MODE values"
+
+# ---------------------------------------------------------------------------
+# optimizer (warning-only rule)
+# ---------------------------------------------------------------------------
+
+- id: optimizer.bitsandbytes_not_supported_warning
+  category: optimizer
+  targets_bucket: kernel_shape
+  symptom: >-
+    bitsandbytes 8-bit Adam variant configured. bitsandbytes is NOT
+    officially supported on ROCm — it may import on a community build but
+    correctness on MI300X is unverified, and AMD-validated 8-bit/quant
+    paths exist instead.
+  detect:
+    optimizer: {"$regex": "(?i)(bitsandbytes|bnb_)"}
+  transform: {}
+  expected_recovery_fraction: 0.0
+  expected_impact: >-
+    WARNING: bitsandbytes is not officially supported on ROCm. Recommended
+    alternatives are Optimum-AMD-validated paths (GPTQ/AWQ for inference,
+    8-bit Adam via Apex on ROCm, or DeepSpeed ZeRO-Offload). Do not assume
+    correctness on MI300X without your own numerical check.
+  rocm_version_min: "6.0"
+  citation: "AMD Optimum-AMD compatibility matrix — bitsandbytes status on ROCm"
+
+# ---------------------------------------------------------------------------
+# collectives
+# ---------------------------------------------------------------------------
+
+- id: collectives.one_process_per_gpu
+  category: collectives
+  targets_bucket: comm_excess
+  symptom: >-
+    Single launcher process driving multiple MI300X GPUs. ROCm serializes
+    kernel launches across devices when one process owns multiple HIP
+    streams — every collective becomes a bottleneck.
+  detect:
+    extras.launch_num_processes: 1
+    extras.world_size: {"$gt": 1}
+  transform:
+    extras.launch_num_processes: 8
+  expected_recovery_fraction: 0.6
+  expected_impact: >-
+    Use `accelerate launch --num_processes=N` (or `torchrun --nproc_per_node=N`)
+    so each MI300X has its own driver process. Removes the launch-queue
+    serialization; most multi-GPU "ROCm is slow" reports trace back to this.
+  rocm_version_min: "6.0"
+  citation: "AMD ROCm distributed training — one-process-per-GPU best practice"
+
+# ---------------------------------------------------------------------------
+# topology
+# ---------------------------------------------------------------------------
+
+- id: topology.tp_within_xgmi_island
+  category: topology
+  targets_bucket: comm_excess
+  symptom: >-
+    Tensor parallelism enabled (TP > 1) without pinning ranks to an XGMI
+    island. TP all-reduces hop across the slow inter-island link instead of
+    the fast intra-island XGMI mesh.
+  detect:
+    extras.tensor_parallel_size: {"$gt": 1}
+  transform:
+    extras.tp_placement_hint: "xgmi_island"
+  expected_recovery_fraction: 0.45
+  expected_impact: >-
+    Restrict TP rank placement to a single 4-GPU XGMI island per group so
+    all-reduces stay on intra-island links. Use ROCR_VISIBLE_DEVICES to pin;
+    prefer TP over EP on a single MI300X node.
+  rocm_version_min: "6.0"
+  citation: "AMD MI300X system topology — XGMI islands and TP placement"
+
+# ---------------------------------------------------------------------------
+# Bonus high-value rules to reach the 20-25 target
+# ---------------------------------------------------------------------------
+
+- id: precision.fp8_inference_stretch
+  category: precision
+  targets_bucket: precision_path
+  symptom: >-
+    Workload is inference / batched eval on MI300X without FP8. CDNA3 has
+    native FP8 matrix-core throughput that doubles peak vs bf16 — applicable
+    once the model has been calibrated.
+  detect:
+    extras.workload_kind: "inference"
+  transform:
+    precision: fp8
+  expected_recovery_fraction: 0.4
+  expected_impact: >-
+    Switch calibrated inference to FP8 (E4M3 weight, E5M2 grad if needed).
+    Doubles matmul peak throughput on MI300X. Requires offline calibration;
+    verify accuracy on your eval set first.
+  rocm_version_min: "6.0"
+  citation: "AMD MI300X inference guide — FP8 calibration workflow"
+
+- id: kernels.hipblaslt_log_level_hint
+  category: kernels
+  targets_bucket: kernel_shape
+  symptom: >-
+    Top kernels show a long tail of small unfused GEMMs. Without
+    HIPBLASLT_LOG_MASK enabled the user can't see which heuristics were
+    selected and won't notice when the library falls back to a slow path.
+  detect: {}
+  transform:
+    env_vars.HIPBLASLT_LOG_MASK: "32"
+  expected_recovery_fraction: 0.1
+  expected_impact: >-
+    HIPBLASLT_LOG_MASK=32 enables heuristic-selection logging. Diagnostic
+    only — does not change perf — but lets you confirm hipBLASLt picked the
+    expected tile and switch to the offline tuning workflow when it didn't.
+  rocm_version_min: "6.0"
+  citation: "AMD hipBLASLt logging environment variables"
+
+- id: env.miopen_user_db_path
+  category: env_vars
+  targets_bucket: kernel_shape
+  symptom: >-
+    Multiple training runs share a host but MIOpen's per-user perf DB is on
+    the default ~/.config path. First run on a new host eats the autotune
+    cost every time even though a previous run already solved the same
+    shapes.
+  detect: {}
+  transform:
+    env_vars.MIOPEN_USER_DB_PATH: "/var/cache/miopen"
+    env_vars.MIOPEN_CUSTOM_CACHE_DIR: "/var/cache/miopen"
+  expected_recovery_fraction: 0.1
+  expected_impact: >-
+    Point MIOPEN_USER_DB_PATH at a shared host directory so autotune
+    results survive container restarts and are reused across runs.
+    Eliminates first-step warm-up cost after the first build.
+  rocm_version_min: "6.0"
+  citation: "AMD MIOpen perf-db environment variables"

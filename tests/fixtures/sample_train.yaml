@@ -1,0 +1,26 @@
+# YAML training config — same schema as JSON, exercised separately so we know
+# yaml.safe_load + dict extraction agree with the JSON path.
+model_name_or_path: meta-llama/Meta-Llama-3-8B
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 16
+max_seq_length: 8192
+learning_rate: 1.0e-4
+warmup_steps: 50
+bf16: true
+optim: adamw_torch
+gradient_checkpointing: true
+torch_compile: false
+dataloader_num_workers: 8
+dataloader_pin_memory: true
+dataloader_prefetch_factor: 2
+dataloader_persistent_workers: true
+attn_implementation: sdpa
+num_train_epochs: 1
+output_dir: ./out
+# Secrets that should be scrubbed:
+hub_token: "hf_yamlsamplehfabcdefghijklmnopqrs1"
+auth_header: "Bearer eyJ.payload.signaturetoken"
+data_path: "/home/teamuser/datasets/alpaca-cleaned"
+env_vars:
+  HSA_FORCE_FINE_GRAIN_PCIE: "1"
+  MIOPEN_FIND_MODE: "3"

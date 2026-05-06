@@ -1,55 +1,231 @@
 """query_rocm_kb tool — semantic search over the curated ROCm rule YAML.
 
-STUB IMPLEMENTATION — Phase 2 agent B replaces this with a real
-sentence-transformers + cosine-similarity index over kb/rocm_rules.yaml.
-Currently returns 2 hardcoded high-impact rules so the rest of the loop runs.
+At import time this module:
+
+  1. Loads ``kb/rocm_rules.yaml`` and validates each entry against the
+     :class:`Rule` pydantic model. Invalid entries are skipped with a
+     ``warnings.warn`` so a single typo never breaks the agent loop.
+  2. Embeds every valid rule's ``symptom`` field with
+     ``sentence-transformers/all-MiniLM-L6-v2``. Embeddings are cached to
+     ``kb/.embeddings_cache_<sha256_of_yaml>.npy`` so subsequent imports
+     skip the ~3-second model load + encode pass.
+  3. Stashes a normalized embedding matrix for fast cosine similarity.
+
+At query time:
+
+  * Embed the query symptom.
+  * Cosine similarity against every rule.
+  * Return the top-k rules sorted by score (descending) inside the standard
+    :class:`ToolResult` envelope.
+
+Each rule is returned as ``rule.model_dump()`` so the agent loop sees plain
+JSON-serializable dicts.
 """
 
 from __future__ import annotations
 
+import hashlib
+import warnings
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import yaml
+from pydantic import ValidationError
+
 from agent.schemas import Rule, ToolResult
 from agent.tools import Tool
 
-_STUB_RULES = [
-    Rule(
-        id="precision.bf16_over_fp16_on_mi300x",
-        category="precision",
-        targets_bucket="precision_path",
-        symptom="fp16 used on MI300X / CDNA3",
-        detect={"precision": "fp16"},
-        transform={"precision": "bf16"},
-        expected_recovery_fraction=0.85,
-        expected_impact=(
-            "MI300X CDNA3 matrix cores execute bf16 at the same throughput as fp16 "
-            "with strictly better numerical stability. Reduces NaN risk in long runs."
-        ),
-        rocm_version_min="6.0",
-        citation="ROCm MI300X Optimization Guide §3.2 — bf16 vs fp16",
-    ),
-    Rule(
-        id="attention.flash_rocm_over_eager",
-        category="attention",
-        targets_bucket="kernel_shape",
-        symptom="naive (eager) attention on MI300X — no flash kernel loaded",
-        detect={"attention_impl": "eager"},
-        transform={"attention_impl": "flash_rocm"},
-        expected_recovery_fraction=0.7,
-        expected_impact=(
-            "Use the ROCm-validated flash-attention kernel (via Optimum-AMD or "
-            "PyTorch SDPA backend). Eliminates O(seq_len^2) attention memory; "
-            "typically 2-3x faster on MI300X for seq_len >= 1024."
-        ),
-        rocm_version_min="6.0",
-        citation="AMD ROCm vLLM/Optimum-AMD docs — Flash Attention validated on MI300",
-    ),
-]
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+
+_KB_DIR = Path(__file__).resolve().parent.parent.parent / "kb"
+_KB_YAML = _KB_DIR / "rocm_rules.yaml"
+_EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
 
-def _query_rocm_kb(symptom: str, top_k: int = 5) -> ToolResult:  # noqa: ARG001 — stub
-    return ToolResult(
-        ok=True,
-        result={"rules": [r.model_dump() for r in _STUB_RULES[:top_k]]},
-    )
+# ---------------------------------------------------------------------------
+# Loading + validation
+# ---------------------------------------------------------------------------
+
+
+def _load_rules(yaml_path: Path) -> tuple[list[Rule], bytes]:
+    """Parse the YAML file, validate each entry, return (rules, raw_bytes).
+
+    The raw bytes are returned alongside so the caller can hash them for the
+    embeddings cache key without re-reading the file.
+    """
+    raw = yaml_path.read_bytes()
+    data = yaml.safe_load(raw)
+    if not isinstance(data, list):
+        raise ValueError(
+            f"{yaml_path}: top-level must be a list of rule dicts, "
+            f"got {type(data).__name__}"
+        )
+
+    rules: list[Rule] = []
+    for idx, entry in enumerate(data):
+        if not isinstance(entry, dict):
+            warnings.warn(
+                f"{yaml_path.name}: skipping entry #{idx} — not a mapping",
+                stacklevel=2,
+            )
+            continue
+        try:
+            rules.append(Rule(**entry))
+        except ValidationError as exc:
+            rule_id = entry.get("id", f"<entry #{idx}>")
+            warnings.warn(
+                f"{yaml_path.name}: skipping rule {rule_id!r} — validation failed: {exc}",
+                stacklevel=2,
+            )
+    return rules, raw
+
+
+# ---------------------------------------------------------------------------
+# Embedding model — lazy singleton so importing this module is cheap when the
+# embeddings cache is warm and we only need to embed at query time.
+# ---------------------------------------------------------------------------
+
+_MODEL: Any = None
+
+
+def _get_model() -> Any:
+    """Return the SentenceTransformer instance, loading it on first use."""
+    global _MODEL
+    if _MODEL is None:
+        # Imported lazily so module import doesn't pay for torch/transformers
+        # if the embeddings cache already covers the rules.
+        from sentence_transformers import SentenceTransformer
+
+        _MODEL = SentenceTransformer(_EMBED_MODEL_NAME)
+    return _MODEL
+
+
+# ---------------------------------------------------------------------------
+# Embeddings — load from cache if hash matches, otherwise compute and persist
+# ---------------------------------------------------------------------------
+
+
+def _cache_path(yaml_bytes: bytes) -> Path:
+    digest = hashlib.sha256(yaml_bytes).hexdigest()
+    return _KB_DIR / f".embeddings_cache_{digest}.npy"
+
+
+def _embed_rules(rules: list[Rule], yaml_bytes: bytes) -> np.ndarray:
+    """Return an (N, D) float32 matrix of L2-normalized rule embeddings.
+
+    Cache layout: a single ``.npy`` file keyed by sha256 of the YAML bytes.
+    If the YAML changes by a single byte the hash flips and we recompute;
+    otherwise the cached embeddings are reused.
+    """
+    cache = _cache_path(yaml_bytes)
+    if cache.exists():
+        try:
+            cached = np.load(cache)
+            # Defend against a corrupt or shape-mismatched cache file. A row
+            # count change implies the rule list changed, even if the YAML
+            # hash collided unrealistically — recompute in that case.
+            if cached.ndim == 2 and cached.shape[0] == len(rules):
+                return cached.astype(np.float32, copy=False)
+            warnings.warn(
+                f"Embeddings cache shape {cached.shape} does not match "
+                f"{len(rules)} rules; recomputing.",
+                stacklevel=2,
+            )
+        except (OSError, ValueError) as exc:
+            warnings.warn(
+                f"Embeddings cache at {cache} unreadable ({exc}); recomputing.",
+                stacklevel=2,
+            )
+
+    symptoms = [r.symptom for r in rules]
+    model = _get_model()
+    embeddings = model.encode(
+        symptoms,
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+        show_progress_bar=False,
+    ).astype(np.float32, copy=False)
+
+    # Best-effort cache write. If the kb/ dir is read-only (e.g. in a frozen
+    # container layer) we still return correct embeddings, just slower next
+    # import.
+    try:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        np.save(cache, embeddings)
+    except OSError as exc:
+        warnings.warn(
+            f"Could not persist embeddings cache to {cache}: {exc}",
+            stacklevel=2,
+        )
+
+    return embeddings
+
+
+# ---------------------------------------------------------------------------
+# Module-level state — populated on import
+# ---------------------------------------------------------------------------
+
+
+def _load_module_state() -> tuple[list[Rule], np.ndarray]:
+    """Load rules + embeddings. Tolerates a missing YAML by returning empty
+    state so downstream tools can still import this module in test setups."""
+    if not _KB_YAML.exists():
+        warnings.warn(
+            f"KB YAML not found at {_KB_YAML}; query_rocm_kb will return no rules.",
+            stacklevel=2,
+        )
+        return [], np.zeros((0, 0), dtype=np.float32)
+    rules, raw = _load_rules(_KB_YAML)
+    if not rules:
+        return [], np.zeros((0, 0), dtype=np.float32)
+    embeddings = _embed_rules(rules, raw)
+    return rules, embeddings
+
+
+_RULES, _RULE_EMBEDDINGS = _load_module_state()
+
+
+# ---------------------------------------------------------------------------
+# Query
+# ---------------------------------------------------------------------------
+
+
+def _query_rocm_kb(symptom: str, top_k: int = 5) -> ToolResult:
+    """Semantic search the KB. See module docstring for the index strategy."""
+    if not symptom or not symptom.strip():
+        return ToolResult(ok=False, error="symptom must be a non-empty string")
+    if top_k < 1:
+        return ToolResult(ok=False, error="top_k must be >= 1")
+
+    if not _RULES:
+        return ToolResult(
+            ok=False,
+            error="Rule index is empty — kb/rocm_rules.yaml missing or all entries invalid.",
+        )
+
+    try:
+        model = _get_model()
+        query_vec = model.encode(
+            [symptom],
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        ).astype(np.float32, copy=False)
+    except Exception as exc:  # pragma: no cover — depends on model state
+        return ToolResult(ok=False, error=f"embedding failed: {type(exc).__name__}: {exc}")
+
+    # Cosine similarity == dot product of L2-normalized vectors.
+    scores = (_RULE_EMBEDDINGS @ query_vec.T).reshape(-1)
+    # argsort ascending, take last `top_k`, reverse for descending. Bounded
+    # by the actual rule count so callers asking for top_k=20 against a
+    # smaller KB get every rule, not an IndexError.
+    k = min(top_k, len(_RULES))
+    top_idx = np.argsort(scores)[-k:][::-1]
+    top_rules = [_RULES[i].model_dump() for i in top_idx]
+    return ToolResult(ok=True, result={"rules": top_rules})
 
 
 QUERY_ROCM_KB = Tool(
