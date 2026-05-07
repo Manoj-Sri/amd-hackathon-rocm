@@ -208,8 +208,59 @@ _RULES, _RULE_EMBEDDINGS = _load_module_state()
 # ---------------------------------------------------------------------------
 
 
+def _keyword_score(symptom: str, rule_text: str) -> float:
+    """Cheap fallback when sentence-transformers can't embed the query.
+
+    Tokenise both sides on word characters, lowercase, drop very short tokens,
+    return the size of the intersection. Not as good as cosine over MiniLM,
+    but more useful than ToolResult(ok=False) when the agent is mid-audit.
+    """
+    import re
+
+    def _toks(s: str) -> set[str]:
+        return {t for t in re.findall(r"[a-zA-Z0-9_]{3,}", s.lower())}
+
+    q_tokens = _toks(symptom)
+    if not q_tokens:
+        return 0.0
+    return float(len(q_tokens & _toks(rule_text)))
+
+
+def _rule_lite(rule: Rule) -> dict[str, Any]:
+    """LLM-facing slim view of a Rule.
+
+    Trims fields the model doesn't need on subsequent tool calls (it only
+    forwards `id` to propose_patch, which looks the full Rule up against
+    the loaded KB). This shrinks query_rocm_kb's output by ~50% so 5-10
+    rules per query don't blow past Qwen2.5-7B's 8K context window.
+    """
+    return {
+        "id": rule.id,
+        "symptom": rule.symptom,
+        "transform": rule.transform,
+        "expected_impact": rule.expected_impact,
+        "citation": rule.citation,
+    }
+
+
+def _query_one_keyword(symptom: str, top_k: int) -> list[dict[str, Any]]:
+    """Last-resort keyword scoring over rule.symptom + rule.id + rule.category."""
+    scored: list[tuple[float, int]] = []
+    for i, rule in enumerate(_RULES):
+        haystack = f"{rule.symptom} {rule.id} {rule.category} {rule.expected_impact}"
+        s = _keyword_score(symptom, haystack)
+        if s > 0:
+            scored.append((s, i))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [_rule_lite(_RULES[i]) for _, i in scored[:top_k]]
+
+
 def _query_one(symptom: str, top_k: int) -> tuple[bool, list[dict[str, Any]] | str]:
-    """Run one cosine-similarity query. Returns (ok, rules-or-error)."""
+    """Run one query. Prefer cosine similarity over MiniLM embeddings; fall back
+    to keyword scoring if sentence-transformers isn't installed (the deployed
+    Hugging Face Space and the rocm/vllm container both omit it for size).
+    Returns (ok, rules-or-error).
+    """
     try:
         model = _get_model()
         query_vec = model.encode(
@@ -218,13 +269,18 @@ def _query_one(symptom: str, top_k: int) -> tuple[bool, list[dict[str, Any]] | s
             normalize_embeddings=True,
             show_progress_bar=False,
         ).astype(np.float32, copy=False)
+    except (ImportError, ModuleNotFoundError):
+        # sentence-transformers missing → keyword-only fallback. Rule
+        # embeddings cache may be loaded (we only need it for cosine,
+        # which we're skipping). Still better than returning empty.
+        return True, _query_one_keyword(symptom, top_k)
     except Exception as exc:  # pragma: no cover — depends on model state
         return False, f"embedding failed: {type(exc).__name__}: {exc}"
 
     scores = (_RULE_EMBEDDINGS @ query_vec.T).reshape(-1)
     k = min(top_k, len(_RULES))
     top_idx = np.argsort(scores)[-k:][::-1]
-    return True, [_RULES[i].model_dump() for i in top_idx]
+    return True, [_rule_lite(_RULES[i]) for i in top_idx]
 
 
 def _query_rocm_kb(

@@ -273,10 +273,16 @@ tutorial](https://lablab.ai/ai-tutorials/amd-developer-cloud-host-llm-vllm).
 # Pull AMD's official rocm/vllm image — has vLLM + ROCm + Qwen support baked in.
 docker pull rocm/vllm:latest
 
-# Run vLLM serving Qwen2.5-7B-Instruct with tool calling enabled.
-# `--tool-call-parser hermes` is the critical flag for Qwen2.5 — it tells
-# vLLM to parse Qwen's Hermes-format <tool_call> tags into the OpenAI
-# `tool_calls` shape the agent expects.
+# Run vLLM serving a Qwen tool-calling model. `--tool-call-parser hermes`
+# is the critical flag — it tells vLLM to parse Qwen's Hermes-format
+# <tool_call> tags into the OpenAI `tool_calls` shape the agent expects.
+#
+# Pick ONE of the model recipes below.
+
+# (a) Qwen2.5-32B-Instruct — recommended for the AMD GPU path. ~64 GB at
+#     bf16 (well under MI300X's 192 GB). Tool calling is significantly
+#     more reliable than 7B and the 32K context fits any audit conversation
+#     comfortably. First run downloads ~64 GB, takes 5-10 minutes.
 docker run -d --name qwen-vllm \
     --device=/dev/kfd --device=/dev/dri --group-add video \
     --ipc=host --shm-size=16g \
@@ -284,15 +290,27 @@ docker run -d --name qwen-vllm \
     -v $HOME/.cache/huggingface:/root/.cache/huggingface \
     -e HF_TOKEN=$HF_TOKEN \
     rocm/vllm:latest \
-    --model Qwen/Qwen2.5-7B-Instruct \
+    --model Qwen/Qwen2.5-32B-Instruct \
     --dtype bfloat16 \
-    --max-model-len 8192 \
+    --max-model-len 32768 \
+    --gpu-memory-utilization 0.85 \
     --enable-auto-tool-choice \
     --tool-call-parser hermes
 
-# Wait ~2 minutes for the model to download + load, then verify:
+# (b) Qwen2.5-7B-Instruct — light/fast, fine for smoke tests, occasionally
+#     hallucinates rule ids on tool calls. Use --max-model-len 32768 (the
+#     model's native cap) to keep audits from exhausting context near the
+#     compare_runs step.
+# docker run -d --name qwen-vllm \
+#     ...same flags as above except...
+#     --model Qwen/Qwen2.5-7B-Instruct \
+#     --max-model-len 32768 \
+#     ...
+
+# Wait for "Application startup complete" in the logs, then verify:
+docker logs -f qwen-vllm    # ctrl-C once you see "Application startup complete"
 curl http://localhost:8000/v1/models
-# → JSON listing Qwen/Qwen2.5-7B-Instruct
+# → JSON listing the model id you served
 ```
 
 Sanity check tool calling end-to-end:
@@ -300,7 +318,7 @@ Sanity check tool calling end-to-end:
 curl -s http://localhost:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "Qwen/Qwen2.5-7B-Instruct",
+    "model": "Qwen/Qwen2.5-32B-Instruct",
     "messages": [{"role": "user", "content": "Call get_weather for Paris."}],
     "tools": [{"type":"function","function":{"name":"get_weather","description":"weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}],
     "tool_choice": "auto"
@@ -313,10 +331,9 @@ Expect a `tool_calls` array with `name=get_weather` and `arguments` mentioning P
 ```bash
 export GOBLIN_AGENT_BACKEND=qwen-vllm
 export GOBLIN_QWEN_VLLM_URL=http://localhost:8000/v1
+export GOBLIN_QWEN_VLLM_MODEL=Qwen/Qwen2.5-32B-Instruct  # match the model you served
 # Optional — only if you fronted vLLM with auth (default vLLM ignores the key):
 # export GOBLIN_QWEN_VLLM_KEY=<your-token>
-# Optional — override the model id if you served something other than the default:
-# export GOBLIN_QWEN_VLLM_MODEL=Qwen/Qwen2.5-32B-Instruct
 
 python -m agent workloads/train_qwen_lora.py
 ```

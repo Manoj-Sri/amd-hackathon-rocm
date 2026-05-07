@@ -34,13 +34,42 @@ mkdir -p "$OUT_DIR"
 # Pin to a single MI300X so concurrent benchmark runs don't fight.
 export ROCR_VISIBLE_DEVICES="${GOBLIN_GPU_ID:-0}"
 
-# Background HBM/power telemetry. Sample at 200 ms and stop on EXIT.
-amd-smi monitor --csv --interval 0.2 \
-    > "$OUT_DIR/amd_smi.csv" 2> "$OUT_DIR/amd_smi.err" &
-AMD_SMI_PID=$!
+# Background HBM/power telemetry. Different amd-smi versions ship slightly
+# different flag names (--interval / --watch / no flag at all in older
+# builds), so try a few variants and gracefully degrade. Telemetry is
+# optional — profile_parser tolerates a missing amd_smi.csv.
+start_amd_smi() {
+    if ! command -v amd-smi >/dev/null 2>&1; then
+        echo "amd-smi not on PATH; skipping telemetry sidecar" \
+            > "$OUT_DIR/amd_smi.err"
+        return 1
+    fi
+    # rocm 6.x: --watch <seconds> --csv. Older: --interval. Plain `monitor`
+    # without flags also works on some builds. Try them in order.
+    for cmd in \
+        "amd-smi monitor --watch 1 --csv --power-usage --gpu-memory --gpu-usage" \
+        "amd-smi monitor --watch 1 --csv" \
+        "amd-smi monitor --csv" ; do
+        # shellcheck disable=SC2086
+        $cmd > "$OUT_DIR/amd_smi.csv" 2> "$OUT_DIR/amd_smi.err" &
+        local pid=$!
+        # Give amd-smi a moment to either start emitting or fail noisily.
+        sleep 0.3
+        if kill -0 "$pid" 2>/dev/null; then
+            AMD_SMI_PID=$pid
+            return 0
+        fi
+    done
+    echo "amd-smi monitor failed to start (no compatible flag set)" \
+        >> "$OUT_DIR/amd_smi.err"
+    return 1
+}
+
+AMD_SMI_PID=
+start_amd_smi || true   # never block the main run on telemetry
 
 cleanup() {
-    if kill -0 "$AMD_SMI_PID" 2>/dev/null; then
+    if [[ -n "${AMD_SMI_PID:-}" ]] && kill -0 "$AMD_SMI_PID" 2>/dev/null; then
         kill "$AMD_SMI_PID" 2>/dev/null || true
         wait "$AMD_SMI_PID" 2>/dev/null || true
     fi

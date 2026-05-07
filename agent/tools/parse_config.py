@@ -428,12 +428,11 @@ def _build_config(
     return WorkloadConfig(**payload)
 
 
-def _parse_config(file_path: str) -> ToolResult:
-    """Parse a training-config artefact into a WorkloadConfig.
-
-    Detects format from the path suffix; ``.py`` runs through the AST visitor,
-    ``.json`` and ``.yaml``/``.yml`` go through the dict path. Anything else is
-    rejected up front rather than guessed.
+def _parse_config_full(file_path: str) -> WorkloadConfig | ToolResult:
+    """Inner parser that returns the **complete** WorkloadConfig (including
+    ``raw_source``). Tests use this to verify redaction. The public
+    ``_parse_config`` wraps this and trims ``raw_source`` from the LLM-
+    facing tool result.
     """
     try:
         path = Path(file_path)
@@ -474,8 +473,26 @@ def _parse_config(file_path: str) -> ToolResult:
             if label not in redactions:
                 redactions.append(label)
 
-        cfg = _build_config(payload, extras, clean, redactions)
-        return ToolResult(ok=True, result=cfg.model_dump())
+        # env_vars come straight from the AST as literal strings — the
+        # source-level redactor matched the *literal expression* in the source
+        # but the value lives in our payload too, so scrub it again.
+        env_vars = payload.get("env_vars")
+        if isinstance(env_vars, dict):
+            env_labels: list[str] = []
+            cleaned_env: dict[str, str] = {}
+            for k, v in env_vars.items():
+                if isinstance(v, str):
+                    cleaned, hits = _redact(v)
+                    cleaned_env[k] = cleaned
+                    env_labels.extend(hits)
+                else:
+                    cleaned_env[k] = v
+            payload["env_vars"] = cleaned_env
+            for label in env_labels:
+                if label not in redactions:
+                    redactions.append(label)
+
+        return _build_config(payload, extras, clean, redactions)
     except SyntaxError as exc:
         return ToolResult(ok=False, error=f"Python parse error: {exc}")
     except json.JSONDecodeError as exc:
@@ -484,6 +501,25 @@ def _parse_config(file_path: str) -> ToolResult:
         return ToolResult(ok=False, error=f"YAML parse error: {exc}")
     except Exception as exc:
         return ToolResult(ok=False, error=f"{type(exc).__name__}: {exc}")
+
+
+def _parse_config(file_path: str) -> ToolResult:
+    """Parse a training-config artefact into a WorkloadConfig and return it
+    as a tool result.
+
+    Detects format from the path suffix; ``.py`` runs through the AST visitor,
+    ``.json`` and ``.yaml``/``.yml`` go through the dict path. Anything else is
+    rejected up front rather than guessed.
+
+    The returned dict **omits** ``raw_source`` to keep the LLM's audit
+    conversation small enough to fit Qwen's context window. The redacted
+    source still lives in ``WorkloadConfig.raw_source`` server-side; tests
+    inspect it via ``_parse_config_full``.
+    """
+    cfg_or_err = _parse_config_full(file_path)
+    if isinstance(cfg_or_err, ToolResult):
+        return cfg_or_err  # error path
+    return ToolResult(ok=True, result=cfg_or_err.model_dump(exclude={"raw_source"}))
 
 
 PARSE_CONFIG = Tool(

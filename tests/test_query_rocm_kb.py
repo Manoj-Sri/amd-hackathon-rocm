@@ -237,12 +237,27 @@ class TestQuery:
             f"{a['id']} — semantic search is degenerate."
         )
 
-    def test_rule_payload_round_trips_through_pydantic(self) -> None:
+    def test_rule_payload_is_lite_shape(self) -> None:
+        # The LLM-facing rule payload is intentionally trimmed from the full
+        # Rule schema — only id / symptom / transform / expected_impact /
+        # citation make it through. This shrinks the audit conversation enough
+        # to fit Qwen2.5-7B's 8K window. Full Rule lookup happens server-side
+        # in propose_patch via the loaded KB.
         result = _query_rocm_kb("any query", top_k=1)
         payload = result.result["rules"][0]
-        # Reconstructible; means model_dump() output is a valid Rule input.
-        rebuilt = Rule(**payload)
-        assert rebuilt.id == payload["id"]
+        assert set(payload.keys()) == {
+            "id",
+            "symptom",
+            "transform",
+            "expected_impact",
+            "citation",
+        }
+        # And the id resolves against the loaded KB so propose_patch can
+        # reconstruct the full Rule.
+        from agent.tools.query_rocm_kb import _RULES
+
+        kb_ids = {r.id for r in _RULES}
+        assert payload["id"] in kb_ids
 
 
 # ---------------------------------------------------------------------------

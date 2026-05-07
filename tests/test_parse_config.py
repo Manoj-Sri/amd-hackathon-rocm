@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from agent.schemas import WorkloadConfig
-from agent.tools.parse_config import PARSE_CONFIG, _parse_config
+from agent.tools.parse_config import PARSE_CONFIG, _parse_config, _parse_config_full
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -156,8 +156,12 @@ class TestRedaction:
         assert "ws_uri" in labels
 
     def test_raw_source_is_scrubbed(self) -> None:
-        cfg = _parse_config(str(FIXTURES / "sample_train.py")).result
-        raw = cfg["raw_source"]
+        # `raw_source` is intentionally stripped from the tool result envelope
+        # (keeps the LLM conversation small) — use the `_full` helper to read
+        # it. The redaction labels list still proves which patterns fired.
+        cfg = _parse_config_full(str(FIXTURES / "sample_train.py"))
+        assert isinstance(cfg, WorkloadConfig)
+        raw = cfg.raw_source
         assert "hf_abcdefghijklmnopqrstuvwxyz123456" not in raw
         assert "sk-abcdefghijklmnopqrstuvwxyz1234567890" not in raw
         assert "gho_abcdefghijklmnopqrstuvwxyz123456" not in raw
@@ -167,12 +171,22 @@ class TestRedaction:
         assert "<REDACTED:hf_token>" in raw
         assert "<REDACTED:openai_key>" in raw
 
+    def test_raw_source_excluded_from_tool_result(self) -> None:
+        # The tool result MUST NOT carry raw_source — it bloated the audit
+        # conversation past 8K on Qwen2.5-7B during the live AMD GPU run.
+        cfg = _parse_config(str(FIXTURES / "sample_train.py")).result
+        assert "raw_source" not in cfg
+
     def test_json_redactions(self) -> None:
         cfg = _parse_config(str(FIXTURES / "sample_train.json")).result
         labels = set(cfg["redactions"])
         assert "hf_token" in labels
         assert "s3_uri" in labels
-        assert "hf_jsonsamplehfabcdefghijklmnopqrs" not in cfg["raw_source"]
+        # raw_source is no longer in the result; verify scrubbing via the
+        # full-config helper.
+        full = _parse_config_full(str(FIXTURES / "sample_train.json"))
+        assert isinstance(full, WorkloadConfig)
+        assert "hf_jsonsamplehfabcdefghijklmnopqrs" not in full.raw_source
 
     def test_extras_values_are_scrubbed(self) -> None:
         # Secret-shaped values that landed in extras must also be redacted —

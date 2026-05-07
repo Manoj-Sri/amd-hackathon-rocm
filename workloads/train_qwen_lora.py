@@ -56,12 +56,17 @@ model = get_peft_model(model, lora_config)
 dataset = load_dataset("yahma/alpaca-cleaned", split="train")
 
 # Hand-rolled DataLoader so parse_config sees the dataloader kwargs explicitly.
+# NOTE: PyTorch raises ValueError if you set prefetch_factor while num_workers=0
+# ("could only be specified in multiprocessing"). The audit is supposed to
+# spot this misconfiguration, not crash on it — so the canonical demo keeps
+# num_workers=0 (the deliberate badness) and lets prefetch_factor default,
+# which parse_config will see as `dataloader_prefetch_factor=None`. The KB
+# rule data.prefetch_factor_default still fires once num_workers is bumped.
 train_loader = DataLoader(
     dataset,
     batch_size=4,
     num_workers=0,        # leaves the GPU starved during training -- data_wait waste
     pin_memory=False,
-    prefetch_factor=2,
     persistent_workers=False,
 )
 
