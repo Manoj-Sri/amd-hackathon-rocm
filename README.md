@@ -67,6 +67,197 @@ python3 -m pytest tests/ -v          # 86 tests, no GPU required
 python3 -m agent workloads/train_qwen_lora.py   # CLI driver, prints SSE events
 ```
 
+## Running on AMD Developer Cloud (MI300X)
+
+End-to-end recipe for the live demo path. Assumes you've got the $100 hackathon
+credits. Plan on ~10-15 GPU-hours total (well under budget).
+
+### 1. Provision an MI300X instance
+
+1. Sign in to [AMD AI Developer Program](https://www.amd.com/en/developer/resources/developer-program.html)
+   and join the AMD Developer Cloud waitlist (instant approval for hackathon
+   participants).
+2. Spin up an **MI300X** instance. Pick the largest container disk you can
+   (the model weights cache is 15-30 GB).
+3. SSH in. You should land in a Linux shell with a `/dev/dri/renderD*`
+   device visible — confirm with `ls /dev/dri`.
+
+### 2. Pull the ROCm + PyTorch container
+
+```bash
+docker pull rocm/pytorch:rocm6.1_ubuntu22.04_py3.10_pytorch_2.3
+```
+
+Run it with the GPU exposed. The `--device` / `--group-add video` lines are
+the only ones that matter for ROCm passthrough:
+
+```bash
+docker run -it --rm \
+    --device=/dev/kfd --device=/dev/dri \
+    --group-add video --ipc=host --shm-size=16g \
+    -v $HOME:/workspace \
+    -e HF_TOKEN=$HF_TOKEN \
+    -e GOBLIN_QWEN_MODEL=Qwen/Qwen2.5-7B-Instruct \
+    -e ROCM_IMAGE_TAG=rocm6.1_pytorch2.3 \
+    -p 8000:8000 -p 8501:8501 \
+    rocm/pytorch:rocm6.1_ubuntu22.04_py3.10_pytorch_2.3 bash
+```
+
+### 3. Verify the GPU is visible inside the container
+
+```bash
+amd-smi monitor          # shows utilization, HBM, power per GPU
+rocprofv3 --version      # confirms the profiler is on PATH
+python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+# → True MI300X
+```
+
+If any of these fail, `LiveRunner` will fall back to `FakeRunner` — the
+agent loop still works, but you get cached metrics instead of a real
+benchmark. Don't chase the bug; the demo lane is intact.
+
+### 4. Clone, install, run
+
+```bash
+cd /workspace
+git clone https://github.com/Manoj-Sri/amd-hackathon-rocm.git goblin
+cd goblin
+
+pip install -e ".[dev]"
+python -m pytest tests/ -q              # 86 tests pass without GPU; faster sanity check
+
+# Live run on MI300X:
+python -m agent workloads/train_qwen_lora.py
+# Streams SSE events: thought, tool_call, tool_result, ..., final_report
+```
+
+### 5. Run the FastAPI server + UI
+
+```bash
+# Terminal 1 (inside the container):
+uvicorn agent.server:app --host 0.0.0.0 --port 8000
+
+# Terminal 2:
+streamlit run ui/app.py --server.port 8501 --server.address 0.0.0.0
+```
+
+If the cloud instance gives you a public IP/URL, port-forward 8501 to your
+laptop. If not, SSH-tunnel: `ssh -L 8501:localhost:8501 user@instance` →
+open `http://localhost:8501` locally.
+
+### 6. Cost-control checklist
+
+- Cache benchmark results (`bench_cache/` is content-addressed by config +
+  workload SHA + container tag, so identical configs are free).
+- Day-1 baseline run is the only "must-burn-GPU" task; everything else can
+  use cached metrics or the FakeRunner.
+- Stop the instance between work sessions. AMD Developer Cloud bills only
+  for running time.
+- Public reference price: ~$1.99/GPU-hour for MI300X VMs. ~$8 of your $100
+  covers a full demo + dry-runs.
+
+## Integrating with HF Qwen
+
+The agent runs on Qwen via Hugging Face **Inference Providers**, which
+auto-routes your request to one of HF's serving partners (Together,
+Fireworks-AI, Nebius, Replicate, ...). You do not run Qwen yourself — HF
+does — and you authenticate with a single token.
+
+### 1. Get a Hugging Face token
+
+1. Sign up at [huggingface.co](https://huggingface.co/).
+2. Create a token at [Settings → Access Tokens](https://huggingface.co/settings/tokens)
+   with **read** + **inference** scope.
+3. Export it:
+   ```bash
+   export HF_TOKEN=hf_yourtokenhere
+   ```
+
+### 2. Join the AMD Developer Hackathon HF Organization
+
+The hackathon submission requires publishing your project as a Hugging Face
+Space within the event organization. Click the "Join" link on the
+[hackathon page](https://lablab.ai/ai-hackathons/amd-developer) (look for
+"Join the AMD Developer Hackathon HF Organization") and accept the
+invitation in your HF account.
+
+### 3. Confirm Qwen reachability
+
+Before running the full agent, smoke-test the HF Inference connection:
+
+```bash
+python - <<'PY'
+import asyncio, os
+from huggingface_hub import AsyncInferenceClient
+
+async def go():
+    client = AsyncInferenceClient(token=os.environ["HF_TOKEN"])
+    resp = await client.chat_completion(
+        model="Qwen/Qwen2.5-7B-Instruct",
+        messages=[{"role": "user", "content": "Say hello in 5 words."}],
+        max_tokens=32,
+    )
+    print(resp.choices[0].message.content)
+
+asyncio.run(go())
+PY
+```
+
+Expect a 1-line Qwen response. If you get an auth error, your token is
+missing the `inference` scope. If you get a 404, the chosen model isn't
+served by any active provider — try `Qwen/Qwen2.5-32B-Instruct` or set
+`provider="together"` explicitly.
+
+### 4. Run the agent against Qwen
+
+The agent picks Qwen automatically — no env var needed beyond `HF_TOKEN`:
+
+```bash
+python -m agent workloads/train_qwen_lora.py
+```
+
+You should see SSE events streaming: `thought` blocks from Qwen, `tool_call`
+events as it picks tools, `tool_result` events, and finally a `final_report`
+with the canonical `142 → 318 tok/s (2.24×)` line.
+
+### 5. Switching the model or provider
+
+Qwen has many variants. Override at process start:
+
+```bash
+# Bigger model, more reliable tool calls:
+export GOBLIN_QWEN_MODEL=Qwen/Qwen2.5-32B-Instruct
+
+# Pin to a specific provider (skip auto-routing):
+export GOBLIN_QWEN_PROVIDER=together     # or fireworks-ai / nebius / replicate
+```
+
+`Qwen/Qwen2.5-7B-Instruct` (the default) is the sweet spot: ~14 GB at
+bf16, fast, supports tool calls. Bump to `-32B-Instruct` if 7B starts
+emitting malformed tool arguments mid-audit.
+
+### 6. Stretch path: self-host Qwen on the same MI300X via vLLM
+
+When the demo is solid, the strongest "AMD-end-to-end" story is to replace
+HF Inference Providers with a vLLM server running on your MI300X. The
+`Backend` protocol in `agent/backends/base.py` makes this a drop-in:
+
+```bash
+docker run -d --name qwen-vllm \
+    --device=/dev/kfd --device=/dev/dri --group-add video \
+    --ipc=host --shm-size=16g -p 8001:8000 \
+    rocm/vllm:latest \
+    --model Qwen/Qwen2.5-7B-Instruct \
+    --dtype bfloat16 --max-model-len 8192 \
+    --enable-auto-tool-choice --tool-call-parser hermes
+```
+
+Then add a `LiveQwenBackend` (subclass `Backend`, point at
+`http://localhost:8001/v1` via the OpenAI SDK) and select it via the
+factory. The rest of the loop, prompts, tools, and tests carry over
+unchanged. This is the day-4 stretch — ship the HF-Inference-Providers
+path first.
+
 ## Configuration Reference
 
 | Env var | Default | Purpose |
