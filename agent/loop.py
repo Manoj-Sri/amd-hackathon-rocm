@@ -36,6 +36,57 @@ def _extract_final_report(
     return None
 
 
+def _auto_compare(
+    tool_results: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Synthesize a Report from the latest patch + two benchmarks when the
+    model forgot to call compare_runs.
+
+    Live-AMD-GPU lesson: Qwen3 sometimes emits its final ``<tool_call>`` for
+    compare_runs *inside* a ``<think>`` block where vLLM's hermes parser
+    can't extract it. Rather than abort the audit, look at the tool log: if
+    we have at least two successful benchmarks (a baseline + a patched run)
+    and the most recent successful propose_patch, we have everything
+    compare_runs needs. Call it deterministically as a last-step fallback.
+
+    Returns the Report dict on success, or None if the prerequisites are
+    missing (no patch, fewer than two benchmarks, etc.).
+    """
+    benchmarks = [
+        e for e in tool_results if e["name"] == "benchmark" and e["ok"]
+    ]
+    patches = [
+        e for e in tool_results if e["name"] == "propose_patch" and e["ok"]
+    ]
+    if len(benchmarks) < 2 or not patches:
+        return None
+
+    latest_patch = patches[-1]["result"]
+    # The first benchmark is the baseline; the most recent is the patched
+    # run. (The model usually does it in this order; if it didn't, the
+    # speedup just shows the wrong direction — but we still return a Report
+    # rather than dropping the audit on the floor.)
+    before = benchmarks[0]["result"]
+    after = benchmarks[-1]["result"]
+
+    workload_name = (
+        latest_patch.get("new_config", {}).get("model_name")
+        or "Audited Workload"
+    )
+    workload_name = f"{workload_name} (auto-synthesized compare_runs)"
+
+    result = tools_module.call(
+        "compare_runs",
+        workload_name=workload_name,
+        before=before,
+        after=after,
+        patch=latest_patch,
+    )
+    if not result.ok:
+        return None
+    return result.result
+
+
 def _safe_json(value: Any) -> str:
     """Serialize a tool result for inclusion in a tool_result content block.
 
@@ -69,11 +120,37 @@ async def _drive(backend: Backend) -> AsyncIterator[SSEEvent]:
     report = _extract_final_report(tool_results_log)
     if report is not None:
         yield SSEEvent(type="final_report", data={"report": report})
-    else:
+        return
+
+    # Fallback: the model didn't call compare_runs (or its tool_call landed
+    # inside a thinking block where the parser couldn't extract it).
+    # Synthesize the report deterministically from the tool log if we have
+    # enough material. See _auto_compare for the prerequisites.
+    auto = _auto_compare(tool_results_log)
+    if auto is not None:
         yield SSEEvent(
-            type="error",
-            data={"message": "Audit completed without producing a final report"},
+            type="thought",
+            data={
+                "text": (
+                    "Note: model did not emit a compare_runs tool call (likely "
+                    "left it inside a <think> block). Synthesizing the final "
+                    "report from the latest propose_patch + two benchmarks."
+                )
+            },
         )
+        yield SSEEvent(type="final_report", data={"report": auto})
+        return
+
+    yield SSEEvent(
+        type="error",
+        data={
+            "message": (
+                "Audit completed without producing a final report (and "
+                "auto-synthesis fallback couldn't run — need at least one "
+                "successful propose_patch and two successful benchmarks)."
+            )
+        },
+    )
 
 
 async def _execute_tool_call(

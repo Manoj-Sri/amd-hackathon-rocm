@@ -44,24 +44,36 @@ start_amd_smi() {
             > "$OUT_DIR/amd_smi.err"
         return 1
     fi
-    # rocm 6.x: --watch <seconds> --csv. Older: --interval. Plain `monitor`
-    # without flags also works on some builds. Try them in order.
-    for cmd in \
-        "amd-smi monitor --watch 1 --csv --power-usage --gpu-memory --gpu-usage" \
-        "amd-smi monitor --watch 1 --csv" \
-        "amd-smi monitor --csv" ; do
+    # `amd-smi monitor` flag surface drifted across rocm versions:
+    #   - some ship `--violation` and reject e.g. `--gpu-usage`
+    #   - some ship `--watch` (seconds), some `--interval`
+    #   - some accept just `monitor` with no flags
+    # Try the safest variants first, give each ~0.5s to either start
+    # emitting or die. Stop on the first one that survives.
+    local variants=(
+        "amd-smi monitor --csv"
+        "amd-smi monitor"
+        "amd-smi monitor --watch 1"
+        "amd-smi monitor --watch 1 --csv"
+        "amd-smi monitor --interval 1"
+        "amd-smi monitor --interval 1 --csv"
+    )
+    for cmd in "${variants[@]}"; do
         # shellcheck disable=SC2086
         $cmd > "$OUT_DIR/amd_smi.csv" 2> "$OUT_DIR/amd_smi.err" &
         local pid=$!
-        # Give amd-smi a moment to either start emitting or fail noisily.
-        sleep 0.3
+        sleep 0.5
         if kill -0 "$pid" 2>/dev/null; then
             AMD_SMI_PID=$pid
             return 0
         fi
     done
-    echo "amd-smi monitor failed to start (no compatible flag set)" \
-        >> "$OUT_DIR/amd_smi.err"
+    # All variants failed. Telemetry is optional; mark it as deliberately
+    # skipped and let the main run proceed — profile_parser tolerates a
+    # missing/empty amd_smi.csv.
+    echo "amd-smi monitor: no compatible flag set in this build; telemetry skipped" \
+        > "$OUT_DIR/amd_smi.skipped"
+    rm -f "$OUT_DIR/amd_smi.csv"
     return 1
 }
 

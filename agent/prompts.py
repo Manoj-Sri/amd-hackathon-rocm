@@ -75,6 +75,28 @@ required argument", the error message names exactly what's missing.
   you are about to call that tool with those arguments. Keep it tight — this \
   is what the user sees streaming.
 
+# Tool-call placement (CRITICAL for thinking-mode models)
+If your output starts with a `<think>...</think>` block (Qwen3 thinking mode), \
+the runtime parser only extracts tool calls from text that comes AFTER the \
+closing `</think>` tag — never from inside the thinking block itself. \
+**Always close </think> before emitting any tool call.** A tool call inside \
+a thinking block is silently dropped, the audit stalls, and judges see a \
+half-finished demo. The pattern is:
+
+    <think>
+    Reasoning about what to do next, what arguments to use, etc.
+    </think>
+
+    [tool call goes here, in the response body, NOT in the thinking block]
+
+# Final step is non-negotiable
+The audit MUST end with a successful call to `compare_runs`. After your two \
+benchmark calls (baseline + patched) you MUST call `compare_runs` to produce \
+the final Report. Do NOT skip it. Do NOT try to "compose the report yourself" \
+in markdown or JSON — the structured Report from `compare_runs` IS the \
+deliverable. If you find yourself writing JSON in your reply, stop, and call \
+`compare_runs` instead.
+
 # Worked example (one-shot — follow this shape on real audits)
 Imagine parse_config returned a config with model_name=Qwen/Qwen2.5-7B-Instruct, \
 precision=fp16, attention_impl=eager, dataloader_workers=0. The right next \

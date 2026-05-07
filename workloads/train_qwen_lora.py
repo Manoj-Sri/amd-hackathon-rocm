@@ -87,13 +87,43 @@ training_args = TrainingArguments(
     torch_compile=False,
     report_to="none",
     push_to_hub=False,
+    # Alpaca columns are [instruction, input, output] — keep them so our
+    # toy collator below can still see them. Without this, HF Trainer drops
+    # them and the dataset becomes empty before forward(). This is purely a
+    # fix-the-script-so-rocprofv3-can-actually-trace-it concern; it has no
+    # bearing on the audit's findings.
+    remove_unused_columns=False,
 )
+
+
+# Tiny collator turning the alpaca rows into input_ids / labels so the
+# Trainer can call forward(). It's intentionally trivial — the goal is to
+# be runnable enough for rocprofv3 to capture a few real training steps,
+# not to actually train anything useful.
+def _toy_collate(rows):
+    texts = [
+        (r.get("instruction") or "")
+        + ("\n" + r["input"] if r.get("input") else "")
+        + "\n"
+        + (r.get("output") or "")
+        for r in rows
+    ]
+    enc = tokenizer(
+        texts,
+        padding=True,
+        truncation=True,
+        max_length=512,
+        return_tensors="pt",
+    )
+    enc["labels"] = enc["input_ids"].clone()
+    return enc
 
 trainer = Trainer(
     model=model,
     args=training_args,
     train_dataset=dataset,
     tokenizer=tokenizer,
+    data_collator=_toy_collate,
 )
 
 if __name__ == "__main__":
