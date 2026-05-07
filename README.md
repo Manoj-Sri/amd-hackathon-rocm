@@ -258,27 +258,96 @@ export GOBLIN_QWEN_PROVIDER=together     # or fireworks-ai / nebius / replicate
 bf16, fast, supports tool calls. Bump to `-32B-Instruct` if 7B starts
 emitting malformed tool arguments mid-audit.
 
-### 6. Stretch path: self-host Qwen on the same MI300X via vLLM
+### 6. Self-host Qwen on the same MI300X via vLLM (Path B)
 
-When the demo is solid, the strongest "AMD-end-to-end" story is to replace
-HF Inference Providers with a vLLM server running on your MI300X. The
-`Backend` protocol in `agent/backends/base.py` makes this a drop-in:
+The strongest "AMD-end-to-end" story: Qwen runs on the same MI300X that
+GPU Goblin is auditing, served by vLLM behind an OpenAI-compatible
+endpoint. Goblin already supports this — pick it with one env var. The
+recipe below mirrors the [lablab vLLM-on-AMD-Developer-Cloud
+tutorial](https://lablab.ai/ai-tutorials/amd-developer-cloud-host-llm-vllm).
+
+#### 6a. Stand up vLLM on the MI300X
 
 ```bash
+# Inside your MI300X cloud instance (rocm/pytorch container or bare host).
+# Pull AMD's official rocm/vllm image — has vLLM + ROCm + Qwen support baked in.
+docker pull rocm/vllm:latest
+
+# Run vLLM serving Qwen2.5-7B-Instruct with tool calling enabled.
+# `--tool-call-parser hermes` is the critical flag for Qwen2.5 — it tells
+# vLLM to parse Qwen's Hermes-format <tool_call> tags into the OpenAI
+# `tool_calls` shape the agent expects.
 docker run -d --name qwen-vllm \
     --device=/dev/kfd --device=/dev/dri --group-add video \
-    --ipc=host --shm-size=16g -p 8001:8000 \
+    --ipc=host --shm-size=16g \
+    -p 8000:8000 \
+    -v $HOME/.cache/huggingface:/root/.cache/huggingface \
+    -e HF_TOKEN=$HF_TOKEN \
     rocm/vllm:latest \
     --model Qwen/Qwen2.5-7B-Instruct \
-    --dtype bfloat16 --max-model-len 8192 \
-    --enable-auto-tool-choice --tool-call-parser hermes
+    --dtype bfloat16 \
+    --max-model-len 8192 \
+    --enable-auto-tool-choice \
+    --tool-call-parser hermes
+
+# Wait ~2 minutes for the model to download + load, then verify:
+curl http://localhost:8000/v1/models
+# → JSON listing Qwen/Qwen2.5-7B-Instruct
 ```
 
-Then add a `LiveQwenBackend` (subclass `Backend`, point at
-`http://localhost:8001/v1` via the OpenAI SDK) and select it via the
-factory. The rest of the loop, prompts, tools, and tests carry over
-unchanged. This is the day-4 stretch — ship the HF-Inference-Providers
-path first.
+Sanity check tool calling end-to-end:
+```bash
+curl -s http://localhost:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "Qwen/Qwen2.5-7B-Instruct",
+    "messages": [{"role": "user", "content": "Call get_weather for Paris."}],
+    "tools": [{"type":"function","function":{"name":"get_weather","description":"weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}],
+    "tool_choice": "auto"
+  }' | python3 -c "import sys,json;r=json.load(sys.stdin);print(r['choices'][0]['message'])"
+```
+Expect a `tool_calls` array with `name=get_weather` and `arguments` mentioning Paris. If you get plain text instead, the `--tool-call-parser hermes` flag was dropped.
+
+#### 6b. Point GPU Goblin at the local vLLM
+
+```bash
+export GOBLIN_AGENT_BACKEND=qwen-vllm
+export GOBLIN_QWEN_VLLM_URL=http://localhost:8000/v1
+# Optional — only if you fronted vLLM with auth (default vLLM ignores the key):
+# export GOBLIN_QWEN_VLLM_KEY=<your-token>
+# Optional — override the model id if you served something other than the default:
+# export GOBLIN_QWEN_VLLM_MODEL=Qwen/Qwen2.5-32B-Instruct
+
+python -m agent workloads/train_qwen_lora.py
+```
+
+Verify the agent picked up the right backend:
+```bash
+curl http://localhost:8000/healthz   # the Goblin server, not vLLM
+# → {"backend": "qwen-vllm", "vllm_url": "http://localhost:8000/v1", ...}
+```
+
+That's it — the agent loop, the tools, the system prompt, the SSE
+streaming, the offline-replay fallback all carry over unchanged. The
+only thing that's different is which OpenAI-compatible endpoint
+``QwenVLLMBackend`` talks to.
+
+#### 6c. Comparing the two backends
+
+| Aspect | `qwen-hf` (default) | `qwen-vllm` |
+|---|---|---|
+| Auth | `HF_TOKEN` | none by default; optional `GOBLIN_QWEN_VLLM_KEY` |
+| Compute | Together / Fireworks-AI / Nebius (HF routes) | Your MI300X |
+| Latency | 200-500 ms / turn (network-bound) | 50-150 ms / turn (in-cluster) |
+| Cost | HF Inference credits | Your AMD Developer Cloud GPU-hours |
+| Demo story | "uses HF as the model hub" | "Qwen runs on the same MI300X it audits" |
+| Setup time | 30 sec (just `HF_TOKEN`) | 2-3 min (model download + warmup) |
+| Best for | HF Space deployment | Pitch demo on MI300X |
+
+Run **both** during the hackathon: `qwen-hf` for the Space (judges who
+click the URL get a real audit without an MI300X); `qwen-vllm` for the
+live pitch demo (the strongest "all AMD" story the judging criterion
+"How effectively the chosen model is integrated" rewards).
 
 ## Deploying to Hugging Face Spaces
 
@@ -376,9 +445,13 @@ submission requirement.
 
 | Env var | Default | Purpose |
 |---|---|---|
-| `HF_TOKEN` | *(none)* | Required for live agent. Hugging Face Inference token. |
-| `GOBLIN_QWEN_MODEL` | `Qwen/Qwen2.5-7B-Instruct` | Override the model the agent runs on. |
+| `GOBLIN_AGENT_BACKEND` | `qwen-hf` | Pick the LLM backend: `qwen-hf` (HF Inference Providers) or `qwen-vllm` (self-hosted vLLM on MI300X). |
+| `HF_TOKEN` | *(none)* | Required when `qwen-hf` is active. Hugging Face Inference token. |
+| `GOBLIN_QWEN_MODEL` | `Qwen/Qwen2.5-7B-Instruct` | Model id used by the `qwen-hf` backend. |
 | `GOBLIN_QWEN_PROVIDER` | `auto` | HF Inference Provider routing (`auto` / `together` / `fireworks-ai` / `nebius` / ...). |
+| `GOBLIN_QWEN_VLLM_URL` | `http://localhost:8000/v1` | Base URL of the self-hosted vLLM endpoint (only used when `qwen-vllm` is active). |
+| `GOBLIN_QWEN_VLLM_MODEL` | `Qwen/Qwen2.5-7B-Instruct` | Model id served by your local vLLM. |
+| `GOBLIN_QWEN_VLLM_KEY` | `EMPTY` | Optional auth token if you front vLLM with nginx/Caddy + auth. |
 | `GOBLIN_BACKEND_URL` | `http://localhost:8000/audit` | UI's backend endpoint. |
 | `ROCM_IMAGE_TAG` | `unknown` | Container tag mixed into the benchmark cache key. |
 | `GOBLIN_GPU_ID` | `0` | Which `/dev/dri/renderD*` to bind in `goblin_runner.sh`. |

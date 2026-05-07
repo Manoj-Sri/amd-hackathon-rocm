@@ -46,14 +46,35 @@ def _has_hf_token() -> bool:
 async def healthz() -> dict:
     """Liveness + tool inventory + active backend. UI uses this to confirm
     the agent is reachable and configured."""
-    return {
+    name = active_backend_name()
+    base = {
         "ok": True,
         "tools": [t.name for t in ALL_TOOLS],
-        "backend": active_backend_name(),
-        "model": os.environ.get("GOBLIN_QWEN_MODEL", "Qwen/Qwen2.5-7B-Instruct"),
-        "provider": os.environ.get("GOBLIN_QWEN_PROVIDER", "auto"),
-        "has_api_key": _has_hf_token(),
+        "backend": name,
     }
+    if name == "qwen-vllm":
+        base.update(
+            {
+                "model": os.environ.get(
+                    "GOBLIN_QWEN_VLLM_MODEL", "Qwen/Qwen2.5-7B-Instruct"
+                ),
+                "vllm_url": os.environ.get(
+                    "GOBLIN_QWEN_VLLM_URL", "http://localhost:8000/v1"
+                ),
+                "has_api_key": True,  # vLLM doesn't require one by default
+            }
+        )
+    else:
+        base.update(
+            {
+                "model": os.environ.get(
+                    "GOBLIN_QWEN_MODEL", "Qwen/Qwen2.5-7B-Instruct"
+                ),
+                "provider": os.environ.get("GOBLIN_QWEN_PROVIDER", "auto"),
+                "has_api_key": _has_hf_token(),
+            }
+        )
+    return base
 
 
 async def _stream_audit(file_path: str) -> AsyncIterator[dict]:
