@@ -1,0 +1,16 @@
+# Hugging Face Space requirements (Streamlit SDK).
+#
+# This is a deliberately MINIMAL list — only what `ui/app.py` and
+# `agent/schemas.py` actually import at runtime. Heavy ML deps
+# (torch / transformers / sentence-transformers / huggingface_hub)
+# are NOT pulled in for the Space because the deployed surface is the
+# offline-replay lane, which reads `tests/fixtures/cached_audit.json`
+# and does not load any model.
+#
+# For the full developer install (FastAPI agent loop + LiveRunner +
+# KB embeddings) use `pip install -e ".[dev]"` against `pyproject.toml`.
+streamlit>=1.32
+altair>=5.2
+pandas>=2.2
+pydantic>=2.6
+requests>=2.31

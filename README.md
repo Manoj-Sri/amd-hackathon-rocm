@@ -1,3 +1,25 @@
+---
+title: GPU Goblin
+emoji: 🧌
+colorFrom: red
+colorTo: red
+sdk: streamlit
+sdk_version: "1.32.0"
+app_file: ui/app.py
+pinned: false
+license: mit
+short_description: An AI agent that hunts wasted compute on AMD MI300X. Powered by Qwen.
+tags:
+  - amd
+  - mi300x
+  - rocm
+  - qwen
+  - huggingface
+  - agent
+  - fine-tuning
+  - llm
+---
+
 # GPU Goblin
 
 > An AI agent that hunts wasted compute on AMD MI300X. Powered by Qwen.
@@ -257,6 +279,98 @@ Then add a `LiveQwenBackend` (subclass `Backend`, point at
 factory. The rest of the loop, prompts, tools, and tests carry over
 unchanged. This is the day-4 stretch — ship the HF-Inference-Providers
 path first.
+
+## Deploying to Hugging Face Spaces
+
+This repo is **already shaped to be a Hugging Face Space** — `README.md`
+carries the YAML frontmatter HF needs, and `requirements.txt` at the root
+is the deliberately-minimal Streamlit-only dependency set (no torch /
+transformers / huggingface_hub at runtime). The deployed Space is the
+**offline-replay lane**: judges interact with a Streamlit UI that streams
+the canonical `142 → 318 tok/s (2.24×)` audit trajectory from
+`tests/fixtures/cached_audit.json`, without a live LLM, without a backend,
+and without our laptop. This is what satisfies the hackathon's "Demo
+Application Platform + Application URL" submission fields.
+
+### One-time setup
+
+1. Create a Hugging Face account at [huggingface.co](https://huggingface.co/)
+   and accept the invite to the **AMD Developer Hackathon HF Organization**
+   (link is on the [hackathon page](https://lablab.ai/ai-hackathons/amd-developer)
+   under the Hugging Face section).
+2. Create a token at [Settings → Access Tokens](https://huggingface.co/settings/tokens)
+   with **`write`** scope (you need write access to push to the Space repo).
+   Save it as `HF_PUSH_TOKEN`.
+3. On the HF organization's page, click **"New Space"**:
+   - Owner: AMD Developer Hackathon org
+   - Space name: `gpu-goblin` (or your preferred slug)
+   - License: MIT
+   - SDK: **Streamlit**
+   - Hardware: **CPU basic** (free; the Space loads no GPU code path)
+   - Visibility: Public
+4. Don't initialize the Space with anything — leave it empty so the first
+   push lands cleanly.
+
+### Deploy
+
+From the project root, push the existing `feat/scaffold` branch to the
+Space's git remote:
+
+```bash
+# Add the Space remote (use HTTPS with your username + HF_PUSH_TOKEN as password):
+git remote add space https://huggingface.co/spaces/<org-slug>/gpu-goblin
+
+# Push (HF Spaces use 'main' as the default branch):
+git push space feat/scaffold:main
+```
+
+You'll see a build log at `https://huggingface.co/spaces/<org-slug>/gpu-goblin`.
+Cold-start takes 30-60 seconds (Streamlit + the pure-pydantic deps); once
+up, the canonical demo trajectory replays in ~10 seconds when a judge
+clicks **"Use sample workload"**.
+
+### What the Space looks like to judges
+
+When a judge opens the Space URL:
+
+1. The lane toggle defaults to **Offline replay** — appropriate for the Space
+   since there's no MI300X behind it.
+2. They click **"Use sample workload"** (which references
+   `workloads/train_qwen_lora.py`).
+3. Streamlit attempts to reach `http://localhost:8000/audit`, fails with
+   `ConnectionError`, surfaces a one-line warning ("Backend unreachable —
+   running offline-replay demo from cached audit"), then plays the cached
+   audit trajectory event-by-event with `~0.4s` pauses between events.
+4. Final report renders: `Tokens/sec: 142 → 318 (2.24×)` with the
+   side-by-side metrics table, waste-budget bar chart, diff viewer, and
+   per-rule citations.
+
+### Updating the Space
+
+After any change to the main repo, redeploy:
+
+```bash
+git push space feat/scaffold:main
+```
+
+HF rebuilds the Space automatically on push.
+
+### (Stretch) Live agent in the Space
+
+The shipped Space is read-only — it doesn't reach a real LLM. If you want
+judges to drive the agent live, two paths:
+
+1. **Stand up the FastAPI backend somewhere reachable** (an MI300X on AMD
+   Developer Cloud, an HF Inference Endpoint, a small CPU box) and set the
+   Space's `GOBLIN_BACKEND_URL` secret to that URL. The Streamlit app will
+   stream real SSE from your backend instead of the cached replay.
+2. **Embed the agent loop in-process** (refactor `ui/app.py` to call
+   `agent.loop.run_audit` directly via `asyncio.run`). This adds
+   `huggingface_hub` to `requirements.txt` and requires `HF_TOKEN` as a
+   Space secret. Larger cold-start, fully self-contained.
+
+Both are post-MVP; the offline-replay Space is what satisfies the
+submission requirement.
 
 ## Configuration Reference
 
