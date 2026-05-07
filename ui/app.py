@@ -21,10 +21,20 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import tempfile
 import time
 from pathlib import Path
 from typing import Any, Iterable, Iterator
+
+# `streamlit run ui/app.py` only adds `ui/` to sys.path, not the repo root,
+# so `from agent.schemas import ...` would fail without this bootstrap.
+# Same problem when the app is deployed as a Hugging Face Space — HF runs
+# `streamlit run ui/app.py` from the repo root, but the script's parent dir
+# is what lands on sys.path. Fix it once, here.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 import altair as alt
 import pandas as pd

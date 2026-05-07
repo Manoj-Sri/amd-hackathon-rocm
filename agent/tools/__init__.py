@@ -11,6 +11,7 @@ requires one edit here (the import + ALL_TOOLS append).
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -58,13 +59,75 @@ def tool_schemas() -> list[dict[str, Any]]:
 def call(name: str, **kwargs: Any) -> ToolResult:
     """Dispatch a tool call by name with keyword args from the JSON-decoded input.
 
-    Wraps unhandled exceptions in a ToolResult(ok=False) so the agent loop
-    never crashes on a tool error — it sees a structured failure instead.
+    Hardening notes (live-AMD-GPU lessons):
+
+    1. **Hallucinated kwargs get silently dropped.** Models routinely invent
+       plausible-sounding argument names (e.g. ``cache=True`` instead of the
+       declared ``force_rerun``). We filter ``kwargs`` against the function's
+       inspected signature so a single fabricated kwarg can't tank the call.
+
+    2. **Missing required args become structured errors.** If the model
+       forgets a required arg (e.g. ``profile_run`` with empty input), we
+       return ``ToolResult(ok=False)`` with a message that names the missing
+       fields and lists what the tool actually accepts. Letting the
+       ``TypeError`` leak just confuses the model on the next turn.
+
+    3. **Any other exception is wrapped, never raised.** Pydantic
+       ``ValidationError``, runtime errors inside the tool, anything — they
+       all surface as ``ToolResult(ok=False, error=...)`` so the agent loop
+       can adapt and the SSE stream stays well-formed.
+
+    Tools that declare ``**kwargs`` themselves are handled transparently —
+    we pass everything through.
     """
     tool = TOOL_BY_NAME.get(name)
     if tool is None:
-        return ToolResult(ok=False, error=f"Unknown tool: {name}")
+        return ToolResult(
+            ok=False,
+            error=f"Unknown tool: {name!r}. Available: {sorted(TOOL_BY_NAME)}",
+        )
+
+    sig = inspect.signature(tool.fn)
+    accepts_var_kwargs = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+    )
+    declared = {
+        p.name
+        for p in sig.parameters.values()
+        if p.kind
+        in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        )
+    }
+
+    if accepts_var_kwargs:
+        filtered = dict(kwargs)
+    else:
+        filtered = {k: v for k, v in kwargs.items() if k in declared}
+
+    missing = [
+        p.name
+        for p in sig.parameters.values()
+        if p.kind
+        in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        )
+        and p.default is inspect.Parameter.empty
+        and p.name not in filtered
+    ]
+    if missing:
+        return ToolResult(
+            ok=False,
+            error=(
+                f"Tool {name!r} is missing required argument(s): "
+                f"{', '.join(missing)}. Accepted arguments: "
+                f"{sorted(declared)}."
+            ),
+        )
+
     try:
-        return tool.fn(**kwargs)
+        return tool.fn(**filtered)
     except Exception as exc:
         return ToolResult(ok=False, error=f"{type(exc).__name__}: {exc}")

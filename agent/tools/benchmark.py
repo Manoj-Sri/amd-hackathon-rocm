@@ -127,15 +127,34 @@ def _write_cache(key: str, metrics: RunMetrics, config: dict, steps: int) -> Non
 # ---------------------------------------------------------------------------
 
 
-def _benchmark(config: dict, steps: int = 50, force_rerun: bool = False) -> ToolResult:
+def _benchmark(
+    config: dict,
+    steps: int = 50,
+    cache: bool = True,
+    force_rerun: bool | None = None,
+) -> ToolResult:
+    """Run a benchmark. ``cache`` is the natural-language knob; ``force_rerun``
+    is kept as a backward-compat alias (cache=False ≡ force_rerun=True).
+    Live-AMD-GPU lesson: the LLM tends to pass ``cache: true`` when it means
+    "use the cache" — make that work directly.
+    """
+    if force_rerun is not None:
+        # Explicit force_rerun overrides cache; legacy callers keep working.
+        use_cache = not force_rerun
+    else:
+        use_cache = bool(cache)
+
     key = _cache_key(config, steps)
 
-    if not force_rerun:
+    if use_cache:
         cached = _read_cache(key)
         if cached is not None:
             metrics_dict = cached.get("metrics", cached)
             metrics = RunMetrics.model_validate(metrics_dict)
-            metrics.warnings = ["benchmark: cache hit (use force_rerun=True to bypass)", *metrics.warnings]
+            metrics.warnings = [
+                "benchmark: cache hit (pass cache=False to bypass)",
+                *metrics.warnings,
+            ]
             return ToolResult(ok=True, result=metrics.model_dump())
 
     workload = WorkloadConfig.model_validate(config)
@@ -151,7 +170,11 @@ BENCHMARK = Tool(
         "but at production-scale step count. Result is cached by a version-"
         "tagged hash so re-runs of the same config are free. Use this AFTER "
         "propose_patch to validate the patched config — and call it once on "
-        "the original config for before/after comparison."
+        "the original config for before/after comparison.\n"
+        "\n"
+        "Pass ``cache: false`` to bypass the cache and force a fresh measurement "
+        "(used by the Day-3 dry-run that confirms cached results haven't gone "
+        "stale). The default ``cache: true`` is what you want for the demo."
     ),
     input_schema={
         "type": "object",
@@ -164,13 +187,13 @@ BENCHMARK = Tool(
                 "maximum": 500,
                 "description": "Number of measured steps (after a 2-step warmup).",
             },
-            "force_rerun": {
+            "cache": {
                 "type": "boolean",
-                "default": False,
+                "default": True,
                 "description": (
-                    "If true, bypass the bench_cache for this call and re-run "
-                    "against the live runner. Used by the Day-3 dry-run pass "
-                    "that confirms cached results haven't gone stale."
+                    "If true (the default), reuse a previous benchmark for "
+                    "the same config + workload + container. If false, force "
+                    "a fresh measurement against the live runner."
                 ),
             },
         },

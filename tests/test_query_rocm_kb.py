@@ -320,9 +320,14 @@ class TestToolDefinition:
     def test_input_schema_shape(self) -> None:
         schema = QUERY_ROCM_KB.input_schema
         assert schema["type"] == "object"
+        # Both single-query (`symptom`) and batched (`symptoms`) shapes are
+        # advertised — either works at runtime, neither is strictly required
+        # in the schema because the impl validates "at least one" itself.
         assert "symptom" in schema["properties"]
+        assert "symptoms" in schema["properties"]
         assert "top_k" in schema["properties"]
-        assert schema["required"] == ["symptom"]
+        assert schema["properties"]["symptoms"]["type"] == "array"
+        assert schema["properties"]["symptoms"]["items"] == {"type": "string"}
 
     def test_fn_is_module_query(self) -> None:
         assert QUERY_ROCM_KB.fn is _query_rocm_kb

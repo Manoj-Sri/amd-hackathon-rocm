@@ -208,10 +208,55 @@ _RULES, _RULE_EMBEDDINGS = _load_module_state()
 # ---------------------------------------------------------------------------
 
 
-def _query_rocm_kb(symptom: str, top_k: int = 5) -> ToolResult:
-    """Semantic search the KB. See module docstring for the index strategy."""
-    if not symptom or not symptom.strip():
-        return ToolResult(ok=False, error="symptom must be a non-empty string")
+def _query_one(symptom: str, top_k: int) -> tuple[bool, list[dict[str, Any]] | str]:
+    """Run one cosine-similarity query. Returns (ok, rules-or-error)."""
+    try:
+        model = _get_model()
+        query_vec = model.encode(
+            [symptom],
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        ).astype(np.float32, copy=False)
+    except Exception as exc:  # pragma: no cover — depends on model state
+        return False, f"embedding failed: {type(exc).__name__}: {exc}"
+
+    scores = (_RULE_EMBEDDINGS @ query_vec.T).reshape(-1)
+    k = min(top_k, len(_RULES))
+    top_idx = np.argsort(scores)[-k:][::-1]
+    return True, [_RULES[i].model_dump() for i in top_idx]
+
+
+def _query_rocm_kb(
+    symptom: str | None = None,
+    symptoms: list[str] | None = None,
+    top_k: int = 5,
+) -> ToolResult:
+    """Semantic search the KB. Accepts a single ``symptom`` (string) or a
+    batch of ``symptoms`` (list of strings).
+
+    Live-AMD-GPU lesson: models naturally batch related queries. We honor
+    that by accepting either form. With a list, we run one similarity pass
+    per element and return the deduplicated union of top-k hits per query —
+    deterministic ordering by best per-query score.
+    """
+    # Normalize input into a non-empty list of trimmed query strings.
+    queries: list[str] = []
+    if symptoms:
+        if not isinstance(symptoms, list) or not all(isinstance(s, str) for s in symptoms):
+            return ToolResult(ok=False, error="symptoms must be a list of strings")
+        queries.extend(s.strip() for s in symptoms if s and s.strip())
+    if symptom:
+        if not isinstance(symptom, str):
+            return ToolResult(ok=False, error="symptom must be a string")
+        if symptom.strip():
+            queries.append(symptom.strip())
+
+    if not queries:
+        return ToolResult(
+            ok=False,
+            error="provide either 'symptom' (string) or 'symptoms' (non-empty list of strings)",
+        )
     if top_k < 1:
         return ToolResult(ok=False, error="top_k must be >= 1")
 
@@ -236,51 +281,58 @@ def _query_rocm_kb(symptom: str, top_k: int = 5) -> ToolResult:
             ),
         )
 
-    try:
-        model = _get_model()
-        query_vec = model.encode(
-            [symptom],
-            convert_to_numpy=True,
-            normalize_embeddings=True,
-            show_progress_bar=False,
-        ).astype(np.float32, copy=False)
-    except Exception as exc:  # pragma: no cover — depends on model state
-        return ToolResult(ok=False, error=f"embedding failed: {type(exc).__name__}: {exc}")
+    seen_ids: set[str] = set()
+    aggregated: list[dict[str, Any]] = []
+    for q in queries:
+        ok, payload = _query_one(q, top_k)
+        if not ok:
+            return ToolResult(ok=False, error=payload)  # type: ignore[arg-type]
+        for rule in payload:  # type: ignore[union-attr]
+            rid = rule["id"]
+            if rid not in seen_ids:
+                seen_ids.add(rid)
+                aggregated.append(rule)
 
-    # Cosine similarity == dot product of L2-normalized vectors.
-    scores = (_RULE_EMBEDDINGS @ query_vec.T).reshape(-1)
-    # argsort ascending, take last `top_k`, reverse for descending. Bounded
-    # by the actual rule count so callers asking for top_k=20 against a
-    # smaller KB get every rule, not an IndexError.
-    k = min(top_k, len(_RULES))
-    top_idx = np.argsort(scores)[-k:][::-1]
-    top_rules = [_RULES[i].model_dump() for i in top_idx]
-    return ToolResult(ok=True, result={"rules": top_rules})
+    return ToolResult(ok=True, result={"rules": aggregated})
 
 
 QUERY_ROCM_KB = Tool(
     name="query_rocm_kb",
     description=(
         "Search the curated ROCm/MI300X optimization knowledge base by natural-"
-        "language symptom. Returns up to top_k Rules with citations. Use this "
-        "after profile_run to find rules matching the observed waste pattern."
+        "language symptom. Pass a single ``symptom`` string OR batch related "
+        "queries via ``symptoms`` (list of strings). Returns the deduplicated "
+        "union of top_k Rules per query, with citations. Use this after "
+        "profile_run to find rules matching the observed waste pattern."
     ),
     input_schema={
         "type": "object",
         "properties": {
             "symptom": {
                 "type": "string",
-                "description": "Natural-language description of the observed problem.",
+                "description": (
+                    "Single natural-language description of the observed "
+                    "problem. Provide either this OR `symptoms`."
+                ),
+            },
+            "symptoms": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Multiple natural-language descriptions to query in one "
+                    "call. Returns the deduplicated union of top_k hits per "
+                    "query. Use when several distinct concerns came out of "
+                    "profile_run (e.g. precision + attention + dataloader)."
+                ),
             },
             "top_k": {
                 "type": "integer",
                 "default": 5,
                 "minimum": 1,
                 "maximum": 20,
-                "description": "Maximum number of rules to return.",
+                "description": "Maximum number of rules to return per query.",
             },
         },
-        "required": ["symptom"],
     },
     fn=_query_rocm_kb,
 )

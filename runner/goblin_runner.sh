@@ -17,11 +17,13 @@
 #   stdout.log         user-script stdout
 #   stderr.log         user-script stderr
 #
-# Failure mode: any non-zero rocprofv3 exit short-circuits the script with the
-# same code. LiveRunner inspects the return code and falls back to FakeRunner
-# so the demo never hard-crashes.
+# Failure mode: any non-zero rocprofv3 exit short-circuits the script. On
+# failure we dump the captured stdout/stderr logs to THIS script's own stderr
+# so `subprocess.run(capture_output=True)` in LiveRunner sees the real error
+# (not just an empty `[]` tail). LiveRunner then archives the whole OUT_DIR
+# under bench_cache/last_runner_failure_<ts>/ so you can inspect after-the-fact.
 
-set -euo pipefail
+set -uo pipefail
 
 : "${USER_SCRIPT:?USER_SCRIPT env var is required}"
 : "${OUT_DIR:?OUT_DIR env var is required}"
@@ -45,9 +47,36 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Dump the captured logs to *our* stderr on a non-zero rocprofv3 exit so the
+# Python subprocess that spawned us actually sees the real error message.
+# Without this the redirected stdout.log / stderr.log live inside the tempdir
+# only and LiveRunner's stderr-tail check sees nothing.
+dump_failure_logs() {
+    local code=$?
+    if [[ $code -ne 0 ]]; then
+        {
+            echo "=== goblin_runner.sh failed with exit code $code ==="
+            echo "=== USER_SCRIPT: $USER_SCRIPT ==="
+            echo "=== OUT_DIR:     $OUT_DIR ==="
+            echo "=== ROCR_VISIBLE_DEVICES: ${ROCR_VISIBLE_DEVICES:-unset} ==="
+            echo
+            echo "=== last 50 lines of $OUT_DIR/stdout.log ==="
+            tail -n 50 "$OUT_DIR/stdout.log" 2>/dev/null || echo "(stdout.log missing)"
+            echo
+            echo "=== last 50 lines of $OUT_DIR/stderr.log ==="
+            tail -n 50 "$OUT_DIR/stderr.log" 2>/dev/null || echo "(stderr.log missing)"
+            echo
+            echo "=== last 20 lines of $OUT_DIR/amd_smi.err ==="
+            tail -n 20 "$OUT_DIR/amd_smi.err" 2>/dev/null || echo "(amd_smi.err missing)"
+        } 1>&2
+    fi
+    return $code
+}
+
 # rocprofv3 collects HSA + kernel traces. The user script is responsible for
 # writing torch_profile.json (the agent injects torch.profiler around the
 # training loop in Phase 3). --output-format csv keeps parsing simple.
+set +e
 rocprofv3 \
     --hsa-trace --kernel-trace \
     --output-directory "$OUT_DIR" \
@@ -58,6 +87,13 @@ rocprofv3 \
         --max_steps="$STEPS" \
         --torch_profile_out="$OUT_DIR/torch_profile.json" \
         > "$OUT_DIR/stdout.log" 2> "$OUT_DIR/stderr.log"
+ROCPROF_EXIT=$?
+set -e
+
+if [[ $ROCPROF_EXIT -ne 0 ]]; then
+    (exit $ROCPROF_EXIT) || dump_failure_logs
+    exit $ROCPROF_EXIT
+fi
 
 # rocprofv3 may write trace_kernel_trace.csv etc. — normalize to trace.csv so
 # profile_parser has one stable filename to look for.

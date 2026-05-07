@@ -189,6 +189,37 @@ class FakeRunner:
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _DEFAULT_RUNNER_SCRIPT = _REPO_ROOT / "runner" / "goblin_runner.sh"
 _DEFAULT_USER_SCRIPT = _REPO_ROOT / "workloads" / "train_qwen_lora.py"
+_FAILURE_ARCHIVE_ROOT = _REPO_ROOT / "bench_cache"
+
+
+def _archive_failure(out_dir: Path, proc: subprocess.CompletedProcess) -> Path:
+    """Copy a failed runner's out_dir into bench_cache/last_runner_failure_<ts>/
+    along with the subprocess's captured stdout/stderr. The directory survives
+    after the tempdir cleanup so the user can `tail -n 100 stderr.log` etc.
+    """
+    import shutil
+    import time
+
+    ts = time.strftime("%Y%m%dT%H%M%S")
+    dest = _FAILURE_ARCHIVE_ROOT / f"last_runner_failure_{ts}"
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+        if out_dir.exists():
+            for child in out_dir.iterdir():
+                target = dest / child.name
+                if child.is_dir():
+                    shutil.copytree(child, target, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(child, target)
+        # Also persist the subprocess's own captured output — these are what
+        # goblin_runner.sh's failure trap dumped.
+        (dest / "subprocess_stdout.log").write_text(proc.stdout or "")
+        (dest / "subprocess_stderr.log").write_text(proc.stderr or "")
+        (dest / "subprocess_returncode").write_text(str(proc.returncode))
+    except OSError as exc:
+        _LOG.warning("LiveRunner: could not archive failure logs (%s)", exc)
+        return dest
+    return dest
 
 
 class LiveRunner:
@@ -276,12 +307,21 @@ class LiveRunner:
                 )
 
             if proc.returncode != 0:
-                tail = (proc.stderr or "").strip().splitlines()[-5:]
+                # Archive the full out_dir to bench_cache/last_runner_failure_<ts>/
+                # so the user can inspect stdout.log / stderr.log / amd_smi.err
+                # after the tempdir cleanup. The path goes into the warning
+                # message so it's surfaced through ToolResult.warnings.
+                archive_path = _archive_failure(out_dir, proc)
+                stderr_tail = (proc.stderr or "").strip().splitlines()[-15:]
+                stdout_tail = (proc.stdout or "").strip().splitlines()[-5:]
                 return self._fallback(
                     config,
                     steps,
                     "LiveRunner: goblin_runner.sh exited with "
-                    f"code {proc.returncode}; using FakeRunner. stderr tail: {tail}",
+                    f"code {proc.returncode}; using FakeRunner. "
+                    f"Failure logs archived at {archive_path}. "
+                    f"stderr tail: {stderr_tail}. "
+                    f"stdout tail: {stdout_tail}.",
                 )
 
             try:
