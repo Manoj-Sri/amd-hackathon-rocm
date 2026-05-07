@@ -1,16 +1,28 @@
 # Hugging Face Space requirements (Streamlit SDK).
 #
-# This is a deliberately MINIMAL list — only what `ui/app.py` and
-# `agent/schemas.py` actually import at runtime. Heavy ML deps
-# (torch / transformers / sentence-transformers / huggingface_hub)
-# are NOT pulled in for the Space because the deployed surface is the
-# offline-replay lane, which reads `tests/fixtures/cached_audit.json`
-# and does not load any model.
+# Shape: Streamlit UI + in-process agent loop, where the agent talks to Qwen
+# via HF Inference Providers. GPU-touching tools (profile_run, benchmark)
+# fall back to FakeRunner — no GPU on the Space, no torch needed.
 #
-# For the full developer install (FastAPI agent loop + LiveRunner +
-# KB embeddings) use `pip install -e ".[dev]"` against `pyproject.toml`.
+# Notably ABSENT:
+#   * `sentence-transformers` / `torch` / `transformers`
+#     We ship a pre-built embeddings cache at `kb/.embeddings_cache_<sha>.npy`
+#     keyed on the YAML's sha256, so query_rocm_kb hits the cache instead of
+#     loading the embedding model. If you edit `kb/rocm_rules.yaml` and push
+#     without rebuilding the cache locally, query_rocm_kb returns ok=False
+#     with a clear message and the rest of the agent loop keeps working.
+#   * `fastapi` / `uvicorn` / `sse-starlette`
+#     The Space embeds the agent loop in-process; no HTTP backend needed.
+#   * `anthropic`
+#     Qwen-only since Phase 3.
+#
+# For the full developer install (FastAPI backend, KB rebuild, ROCm runner)
+# use `pip install -e ".[dev]"` against `pyproject.toml`.
 streamlit>=1.32
 altair>=5.2
 pandas>=2.2
 pydantic>=2.6
 requests>=2.31
+huggingface_hub>=0.28
+numpy>=1.26
+PyYAML>=6.0

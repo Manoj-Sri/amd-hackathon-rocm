@@ -12,7 +12,9 @@ venv/
 
 # Goblin-specific
 bench_cache/
-kb/.embeddings_cache_*.npy
+# kb/.embeddings_cache_*.npy is intentionally TRACKED — see README "Deploying
+# to Hugging Face Spaces". Shipping the cache keyed on the current YAML's
+# sha256 keeps the Space cold-start fast (no sentence-transformers download).
 *.trace.csv
 *.trace.json
 .env

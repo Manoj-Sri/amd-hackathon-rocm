@@ -128,17 +128,93 @@ def _stream_from_cache() -> Iterator[dict[str, Any]]:
         yield ev
 
 
-def _events_for(uploaded_path: Path | None, lane: str) -> Iterator[dict[str, Any]]:
-    """Return an event iterator. Falls back to cached replay if backend is down."""
-    if uploaded_path is not None:
+def _has_hf_token() -> bool:
+    return bool(os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACEHUB_API_TOKEN"))
+
+
+def _stream_from_inproc(uploaded_path: Path) -> Iterator[dict[str, Any]]:
+    """Drive `agent.loop.run_audit` in a worker thread; yield events synchronously.
+
+    Bridges Streamlit's sync world to the loop's async generator. The agent
+    runs in a background thread with its own asyncio event loop; events
+    arrive on a bounded queue that this generator drains until a sentinel.
+
+    All heavy imports happen inside this function so that `ui.app` itself
+    stays light when the in-process lane isn't engaged.
+    """
+    import asyncio
+    import queue
+    import threading
+
+    from agent.loop import run_audit
+
+    SENTINEL: object = object()
+    q: "queue.Queue[Any]" = queue.Queue(maxsize=128)
+
+    async def _producer() -> None:
         try:
-            yield from _stream_from_backend(uploaded_path, lane)
-            return
-        except (requests.ConnectionError, requests.Timeout, requests.HTTPError) as exc:
-            st.warning(
-                f"Backend unreachable ({type(exc).__name__}) — running offline-replay "
-                "demo from cached audit."
+            async for event in run_audit(str(uploaded_path)):
+                q.put({"type": event.type, "data": event.data})
+        except Exception as exc:  # pragma: no cover — defence-in-depth
+            q.put(
+                {
+                    "type": "error",
+                    "data": {"message": f"in-proc agent: {type(exc).__name__}: {exc}"},
+                }
             )
+        finally:
+            q.put(SENTINEL)
+
+    def _runner() -> None:
+        # Each thread needs its own event loop; asyncio.run handles setup +
+        # teardown for us.
+        asyncio.run(_producer())
+
+    thread = threading.Thread(target=_runner, daemon=True, name="goblin-agent-loop")
+    thread.start()
+
+    try:
+        while True:
+            item = q.get()
+            if item is SENTINEL:
+                break
+            yield item
+    finally:
+        thread.join(timeout=5)
+
+
+def _events_for(uploaded_path: Path | None, lane: str) -> Iterator[dict[str, Any]]:
+    """Return an event iterator. Three live paths in priority order:
+    (1) in-process Qwen via HF Inference Providers when HF_TOKEN is set;
+    (2) external FastAPI backend via GOBLIN_BACKEND_URL;
+    (3) cached replay (always works).
+
+    The two upstream paths each get one chance with a clear st.warning on
+    failure. Offline lane skips straight to cache.
+    """
+    if uploaded_path is None or lane != "live":
+        yield from _stream_from_cache()
+        return
+
+    if _has_hf_token():
+        try:
+            yield from _stream_from_inproc(uploaded_path)
+            return
+        except Exception as exc:
+            st.warning(
+                f"In-process agent failed ({type(exc).__name__}: {exc}) — "
+                "trying external backend, then cached replay."
+            )
+
+    try:
+        yield from _stream_from_backend(uploaded_path, lane)
+        return
+    except (requests.ConnectionError, requests.Timeout, requests.HTTPError) as exc:
+        st.warning(
+            f"Backend unreachable ({type(exc).__name__}) — running offline-replay "
+            "demo from cached audit."
+        )
+
     yield from _stream_from_cache()
 
 
@@ -502,11 +578,27 @@ def main() -> None:
     # ------- Lane selector -------
     lane = st.radio(
         "Demo lane",
-        options=["Offline replay (synthetic corpus)", "Live MI300X"],
+        options=["Offline replay (synthetic corpus)", "Live agent"],
         horizontal=True,
         index=0,
     )
     lane_token = "offline" if lane.startswith("Offline") else "live"
+
+    if lane_token == "live":
+        if _has_hf_token():
+            qwen_model = os.environ.get("GOBLIN_QWEN_MODEL", "Qwen/Qwen2.5-7B-Instruct")
+            st.caption(
+                f"🟢 Live mode: agent runs **{qwen_model}** in-process via Hugging "
+                "Face Inference Providers. GPU-touching tools (profile_run, "
+                "benchmark) use the FakeRunner with cached MI300X metrics — "
+                "this is the demo lane for the Hugging Face Space."
+            )
+        elif BACKEND_URL != DEFAULT_BACKEND or BACKEND_URL == DEFAULT_BACKEND:
+            st.caption(
+                f"🔵 Live mode: streaming SSE from `{BACKEND_URL}`. Falls back "
+                "to cached replay if unreachable. Set `HF_TOKEN` to instead "
+                "drive Qwen in-process without a backend."
+            )
 
     # ------- File picker -------
     st.subheader("1. Pick a workload")

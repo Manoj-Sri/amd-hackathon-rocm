@@ -141,7 +141,22 @@ def _embed_rules(rules: list[Rule], yaml_bytes: bytes) -> np.ndarray:
             )
 
     symptoms = [r.symptom for r in rules]
-    model = _get_model()
+    try:
+        model = _get_model()
+    except ImportError as exc:
+        # On Hugging Face Spaces we deliberately omit `sentence-transformers`
+        # from `requirements.txt` to keep the cold-start fast — the YAML hash
+        # of the shipped KB matches a committed cache file. If someone edits
+        # `kb/rocm_rules.yaml` without re-running the cache build, we land
+        # here. Return a zero-width embedding matrix and let the query path
+        # surface a clean ToolResult(ok=False) so the agent loop can adapt
+        # rather than crash.
+        warnings.warn(
+            f"sentence-transformers unavailable ({exc}); KB will return "
+            "ok=False until the embeddings cache is rebuilt for the new YAML.",
+            stacklevel=2,
+        )
+        return np.zeros((len(rules), 0), dtype=np.float32)
     embeddings = model.encode(
         symptoms,
         convert_to_numpy=True,
@@ -204,6 +219,21 @@ def _query_rocm_kb(symptom: str, top_k: int = 5) -> ToolResult:
         return ToolResult(
             ok=False,
             error="Rule index is empty — kb/rocm_rules.yaml missing or all entries invalid.",
+        )
+
+    if _RULE_EMBEDDINGS.ndim != 2 or _RULE_EMBEDDINGS.shape[1] == 0:
+        # Resilient-degradation path — see `_embed_rules`. The shipped cache
+        # didn't match the current YAML and `sentence-transformers` isn't
+        # installed in this environment, so we have rules but no usable
+        # embedding index.
+        return ToolResult(
+            ok=False,
+            error=(
+                "KB embeddings unavailable — the committed cache doesn't match "
+                "the current kb/rocm_rules.yaml and sentence-transformers is "
+                "not installed. Rebuild the cache locally and recommit, or "
+                "install the dev extras."
+            ),
         )
 
     try:
