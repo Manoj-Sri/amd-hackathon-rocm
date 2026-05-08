@@ -44,19 +44,27 @@ start_amd_smi() {
             > "$OUT_DIR/amd_smi.err"
         return 1
     fi
-    # `amd-smi monitor` flag surface drifted across rocm versions:
-    #   - some ship `--violation` and reject e.g. `--gpu-usage`
-    #   - some ship `--watch` (seconds), some `--interval`
-    #   - some accept just `monitor` with no flags
-    # Try the safest variants first, give each ~0.5s to either start
-    # emitting or die. Stop on the first one that survives.
+    # `amd-smi monitor` flag surface drifted across rocm versions. Verified
+    # combos in increasing order of legacy-ness:
+    #   ROCm 7.x  : `--watch <s> -p -u -m -v --csv` (renamed flags + must
+    #               specify at least one metric flag, otherwise the CLI
+    #               trips an internal `AttributeError: 'violation'`)
+    #   ROCm 6.x  : `--watch <s> --csv` worked alone in some builds
+    #   pre-6.0   : `--interval <s>` instead of `--watch`
+    #   very old  : just `amd-smi monitor` (or even `amd-smi`) implicit
+    # Try newest-first; first one that survives 0.5s is kept.
     local variants=(
+        # ROCm 7.x-flavored: explicit metric flags + watch + csv
+        "amd-smi monitor --watch 1 --power-usage --gfx --mem --vram-usage --csv"
+        "amd-smi monitor -w 1 -p -u -m -v --csv"
+        # ROCm 6.x intermediate forms
+        "amd-smi monitor --watch 1 --csv"
+        "amd-smi monitor --watch 1"
+        # Older / fallback
+        "amd-smi monitor --interval 1 --csv"
+        "amd-smi monitor --interval 1"
         "amd-smi monitor --csv"
         "amd-smi monitor"
-        "amd-smi monitor --watch 1"
-        "amd-smi monitor --watch 1 --csv"
-        "amd-smi monitor --interval 1"
-        "amd-smi monitor --interval 1 --csv"
     )
     for cmd in "${variants[@]}"; do
         # shellcheck disable=SC2086
