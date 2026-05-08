@@ -122,16 +122,77 @@ def _call_name(node: ast.Call) -> str:
     return ""
 
 
-def _kwargs_to_dict(node: ast.Call) -> dict[str, Any]:
-    """Pull literal kwargs out of a Call. Non-literal values are dropped."""
+def _kwargs_to_dict(
+    node: ast.Call, dict_constants: dict[str, dict[str, Any]] | None = None
+) -> dict[str, Any]:
+    """Pull literal kwargs out of a Call.
+
+    Also resolves ``**dict_var`` splats when the splat target was assigned a
+    literal dict elsewhere in the module (the resolved dict is in
+    ``dict_constants``). This is defensive against the common refactor pattern
+    ``_ta = dict(...); TrainingArguments(**_ta)`` — if the parser doesn't
+    follow the splat, every TrainingArguments field disappears and the agent
+    reasons over HF defaults instead of the script's actual values.
+    """
     out: dict[str, Any] = {}
+    dict_constants = dict_constants or {}
     for kw in node.keywords:
         if kw.arg is None:
+            # `**something` splat. If something is a Name that resolves to a
+            # dict literal we collected in pass 1, lift those entries in.
+            if isinstance(kw.value, ast.Name):
+                resolved = dict_constants.get(kw.value.id)
+                if resolved:
+                    for k, v in resolved.items():
+                        # Don't override anything an explicit kwarg already set.
+                        out.setdefault(k, v)
             continue
         val = _literal(kw.value)
         if val is not None or isinstance(kw.value, ast.Constant):
             out[kw.arg] = val
     return out
+
+
+def _collect_dict_constants(tree: ast.AST) -> dict[str, dict[str, Any]]:
+    """Find module-level ``NAME = dict(k=v, ...)`` and ``NAME = {k: v, ...}``
+    assignments where every value is a literal. Returns name → resolved dict.
+
+    Used by ``_kwargs_to_dict`` to follow ``**NAME`` splats.
+    """
+    constants: dict[str, dict[str, Any]] = {}
+    for stmt in getattr(tree, "body", []):
+        if not isinstance(stmt, ast.Assign):
+            continue
+        targets = [t for t in stmt.targets if isinstance(t, ast.Name)]
+        if not targets:
+            continue
+        resolved: dict[str, Any] | None = None
+        # `dict(k=v, ...)` form
+        if (
+            isinstance(stmt.value, ast.Call)
+            and isinstance(stmt.value.func, ast.Name)
+            and stmt.value.func.id == "dict"
+        ):
+            resolved = {}
+            for kw in stmt.value.keywords:
+                if kw.arg is None:
+                    continue
+                val = _literal(kw.value)
+                if val is not None or isinstance(kw.value, ast.Constant):
+                    resolved[kw.arg] = val
+        # `{"k": v, ...}` form
+        elif isinstance(stmt.value, ast.Dict):
+            resolved = {}
+            for k_node, v_node in zip(stmt.value.keys, stmt.value.values):
+                if not isinstance(k_node, ast.Constant) or not isinstance(k_node.value, str):
+                    continue
+                val = _literal(v_node)
+                if val is not None or isinstance(v_node, ast.Constant):
+                    resolved[k_node.value] = val
+        if resolved:
+            for t in targets:
+                constants[t.id] = resolved
+    return constants
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +309,10 @@ def _extract_from_python(source: str) -> tuple[dict[str, Any], dict[str, Any]]:
                 if isinstance(target, ast.Name):
                     constants[target.id] = val
 
+    # Pass 1b: harvest dict-shaped constants so `**name` splats into Calls
+    # can be resolved (e.g. `_ta = dict(...); TrainingArguments(**_ta)`).
+    dict_constants = _collect_dict_constants(tree)
+
     def _arg_value(node: ast.AST) -> Any:
         """Literal eval, falling back to the constants table for bare Names."""
         val = _literal(node)
@@ -264,11 +329,11 @@ def _extract_from_python(source: str) -> tuple[dict[str, Any], dict[str, Any]]:
             short = name.rsplit(".", 1)[-1] if name else ""
 
             if short in ("TrainingArguments", "Seq2SeqTrainingArguments"):
-                kw = _kwargs_to_dict(node)
+                kw = _kwargs_to_dict(node, dict_constants)
                 raw_training_args.update(kw)
 
             elif short == "DataLoader":
-                kw = _kwargs_to_dict(node)
+                kw = _kwargs_to_dict(node, dict_constants)
                 _apply_kwargs(payload, kw, extras, _DATALOADER_MAP)
 
             elif name == "torch.compile" or (

@@ -79,7 +79,9 @@ train_loader = DataLoader(
     persistent_workers=True,
 )
 
-_ta_kwargs = dict(
+_RUNTIME_MAX_STEPS = _runtime.max_steps if _runtime.max_steps > 0 else -1
+
+training_args = TrainingArguments(
     output_dir="./out",
     per_device_train_batch_size=8,
     gradient_accumulation_steps=4,
@@ -97,11 +99,8 @@ _ta_kwargs = dict(
     torch_compile=False,
     report_to="none",
     push_to_hub=False,
+    max_steps=_RUNTIME_MAX_STEPS,
 )
-if _runtime.max_steps > 0:
-    _ta_kwargs["max_steps"] = _runtime.max_steps
-    _ta_kwargs["num_train_epochs"] = 1
-training_args = TrainingArguments(**_ta_kwargs)
 
 trainer = Trainer(
     model=model,

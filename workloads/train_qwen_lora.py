@@ -81,7 +81,17 @@ train_loader = DataLoader(
     persistent_workers=False,
 )
 
-_ta_kwargs = dict(
+# NOTE: keep TrainingArguments(...) called with LITERAL kwargs — parse_config
+# walks the AST and only extracts kwargs whose values are literals (or simple
+# identifiers it has seen). A `**dict_var` splat or a runtime expression hides
+# the value from the parser, which then falls back to HF defaults
+# (batch_size=1, lr=5e-5, etc.) and the agent reasons over the wrong config.
+# `--max_steps` is the one runtime override, but it isn't a WorkloadConfig
+# field so the parser doesn't need to see it; passing it as an expression is
+# fine.
+_RUNTIME_MAX_STEPS = _runtime.max_steps if _runtime.max_steps > 0 else -1
+
+training_args = TrainingArguments(
     output_dir="./out",
     per_device_train_batch_size=4,        # leaves HBM on the floor at 192 GB
     gradient_accumulation_steps=8,
@@ -104,15 +114,10 @@ _ta_kwargs = dict(
     # fix-the-script-so-rocprofv3-can-actually-trace-it concern; it has no
     # bearing on the audit's findings.
     remove_unused_columns=False,
+    # Runtime override only (parser ignores non-literals; HF Trainer treats
+    # max_steps=-1 as "use num_train_epochs"):
+    max_steps=_RUNTIME_MAX_STEPS,
 )
-# Honor the --max_steps arg so goblin_runner.sh's 10-step / 50-step
-# requests actually short-circuit training (rather than running for hours
-# and tripping LiveRunner's timeout).
-if _runtime.max_steps > 0:
-    _ta_kwargs["max_steps"] = _runtime.max_steps
-    _ta_kwargs["num_train_epochs"] = 1  # compatibility — max_steps wins anyway
-
-training_args = TrainingArguments(**_ta_kwargs)
 
 
 # Tiny collator turning the alpaca rows into input_ids / labels so the

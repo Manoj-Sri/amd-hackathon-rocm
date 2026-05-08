@@ -280,3 +280,98 @@ class TestSchema:
         assert PARSE_CONFIG.name == "parse_config"
         assert PARSE_CONFIG.fn is _parse_config
         assert "file_path" in PARSE_CONFIG.input_schema["properties"]
+
+
+# ---------------------------------------------------------------------------
+# Regression: canonical + scenario workloads must parse with all the right
+# audit-relevant fields. These are what the live agent actually sees, so a
+# regression here directly degrades audit quality (the agent reasons over
+# HF defaults instead of the script's settings).
+# ---------------------------------------------------------------------------
+
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+class TestCanonicalWorkload:
+    def test_canonical_workload_extracts_full_config(self) -> None:
+        """The canonical demo workload must yield batch_size=4, lr=2e-4, etc.
+        — not HF defaults. Catches the `**dict_var` splat regression where
+        every TrainingArguments kwarg disappears.
+        """
+        result = _parse_config(str(REPO_ROOT / "workloads" / "train_qwen_lora.py"))
+        assert result.ok, result.error
+        cfg = result.result
+        assert cfg["model_name"] == "Qwen/Qwen2.5-7B-Instruct"
+        assert cfg["batch_size"] == 4, (
+            "expected batch_size=4 from per_device_train_batch_size; "
+            "did `**_ta_kwargs` splat hide the kwargs?"
+        )
+        assert cfg["grad_accum_steps"] == 8
+        assert cfg["lr"] == 2e-4
+        assert cfg["warmup_steps"] == 100
+        assert cfg["precision"] == "fp16"
+        assert cfg["attention_impl"] == "eager"
+        assert cfg["dataloader_workers"] == 0
+        assert cfg["dataloader_pin_memory"] is False
+        assert cfg["lora_rank"] == 16
+        assert cfg["torch_compile"] is False
+        assert cfg["env_vars"]["HSA_FORCE_FINE_GRAIN_PCIE"] == "1"
+
+
+class TestSplatKwargsResolution:
+    """`_ta = dict(k=v); Foo(**_ta)` must resolve back through the dict
+    constant. Defensive — the canonical workload no longer uses this
+    pattern, but third-party scripts often do.
+    """
+
+    def test_dict_function_call_splat(self, tmp_path) -> None:
+        src = """
+from transformers import TrainingArguments
+
+_ta = dict(
+    per_device_train_batch_size=8,
+    gradient_accumulation_steps=2,
+    fp16=True,
+    optim=\"adamw_torch_fused\",
+)
+training_args = TrainingArguments(output_dir=\"./out\", **_ta)
+"""
+        p = tmp_path / "splat.py"
+        p.write_text(src)
+        cfg = _parse_config(str(p)).result
+        assert cfg["batch_size"] == 8
+        assert cfg["grad_accum_steps"] == 2
+        assert cfg["precision"] == "fp16"
+        assert cfg["optimizer"] == "adamw_torch_fused"
+
+    def test_dict_literal_splat(self, tmp_path) -> None:
+        src = """
+from transformers import TrainingArguments
+
+_ta = {
+    "per_device_train_batch_size": 16,
+    "bf16": True,
+}
+training_args = TrainingArguments(output_dir=\"./out\", **_ta)
+"""
+        p = tmp_path / "splat_literal.py"
+        p.write_text(src)
+        cfg = _parse_config(str(p)).result
+        assert cfg["batch_size"] == 16
+        assert cfg["precision"] == "bf16"
+
+    def test_explicit_kwarg_overrides_splat(self, tmp_path) -> None:
+        src = """
+from transformers import TrainingArguments
+
+_ta = dict(per_device_train_batch_size=8)
+training_args = TrainingArguments(per_device_train_batch_size=32, **_ta)
+"""
+        p = tmp_path / "splat_override.py"
+        p.write_text(src)
+        cfg = _parse_config(str(p)).result
+        # Explicit kwarg wins over splat (both occur in the kwargs list,
+        # explicit comes first in the AST → setdefault keeps it).
+        assert cfg["batch_size"] == 32
+
