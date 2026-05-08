@@ -33,12 +33,45 @@ from agent.tools import Tool
 
 # Patch-shape sentinel keys: a real Patch dict has at minimum new_config + diff.
 _PATCH_KEYS = {"new_config", "diff", "rationale", "expected_speedup_low"}
-# WorkloadConfig sentinel keys: presence of these without _PATCH_KEYS means
-# the LLM passed a flat config as the patch.
-_FLAT_CONFIG_KEYS = {"model_name", "precision", "attention_impl", "batch_size"}
+
+# WorkloadConfig sentinel keys: presence of any of these (without _PATCH_KEYS)
+# means the LLM passed a flat WorkloadConfig instead of a Patch envelope.
+# Broader than just the "always-set" fields — Qwen has been observed to send
+# only the *changed* fields after propose_patch (e.g. just the dataloader
+# group), so we accept any WorkloadConfig field name as a signal.
+_FLAT_CONFIG_KEYS = frozenset(
+    {
+        "model_name",
+        "precision",
+        "attention_impl",
+        "batch_size",
+        "grad_accum_steps",
+        "seq_len",
+        "optimizer",
+        "gradient_checkpointing",
+        "lora_rank",
+        "dataloader_workers",
+        "dataloader_pin_memory",
+        "dataloader_prefetch_factor",
+        "dataloader_persistent_workers",
+        "torch_compile",
+        "lr",
+        "warmup_steps",
+        "env_vars",
+    }
+)
 
 
 def _looks_like_flat_config(d: dict[str, Any]) -> bool:
+    """Return True iff `d` looks like a flat WorkloadConfig (or partial diff)
+    rather than a Patch envelope.
+
+    A real Patch always carries at least one of `_PATCH_KEYS` (`new_config`,
+    `diff`, etc.). If none of those are present and at least one
+    WorkloadConfig field is, the LLM almost certainly forwarded a flat config
+    or a partial diff. ``_normalize_patch`` then recovers via the cached
+    propose_patch result.
+    """
     if not isinstance(d, dict):
         return False
     if any(k in d for k in _PATCH_KEYS):
