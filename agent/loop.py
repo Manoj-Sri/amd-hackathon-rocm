@@ -39,18 +39,25 @@ def _extract_final_report(
 def _auto_compare(
     tool_results: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
-    """Synthesize a Report from the latest patch + two benchmarks when the
-    model forgot to call compare_runs.
+    """Synthesize a Report from whatever the audit produced when the model
+    didn't reach `compare_runs` cleanly. Three recovery tiers, in order of
+    fidelity:
 
-    Live-AMD-GPU lesson: Qwen3 sometimes emits its final ``<tool_call>`` for
-    compare_runs *inside* a ``<think>`` block where vLLM's hermes parser
-    can't extract it. Rather than abort the audit, look at the tool log: if
-    we have at least two successful benchmarks (a baseline + a patched run)
-    and the most recent successful propose_patch, we have everything
-    compare_runs needs. Call it deterministically as a last-step fallback.
+    Tier 1 — full data: ≥2 benchmarks + ≥1 propose_patch.
+        Treat first benchmark as baseline, last as patched run. Highest
+        fidelity since both numbers are real.
 
-    Returns the Report dict on success, or None if the prerequisites are
-    missing (no patch, fewer than two benchmarks, etc.).
+    Tier 2 — patch but only one benchmark: ≥1 patch + 1 benchmark.
+        Use the single benchmark as baseline. For the "after" side, run
+        FakeRunner on the patched config to get a deterministic projection.
+        Marks the report as projected so the demo is honest about it.
+
+    Tier 3 — no patch ran but we have rules from query_rocm_kb + ≥1 benchmark.
+        We *could* deterministically apply propose_patch ourselves here, but
+        that's over-reaching. Return None and let the caller surface a
+        clean error instead.
+
+    Returns the Report dict, or None when no tier applies.
     """
     benchmarks = [
         e for e in tool_results if e["name"] == "benchmark" and e["ok"]
@@ -58,33 +65,58 @@ def _auto_compare(
     patches = [
         e for e in tool_results if e["name"] == "propose_patch" and e["ok"]
     ]
-    if len(benchmarks) < 2 or not patches:
-        return None
 
-    latest_patch = patches[-1]["result"]
-    # The first benchmark is the baseline; the most recent is the patched
-    # run. (The model usually does it in this order; if it didn't, the
-    # speedup just shows the wrong direction — but we still return a Report
-    # rather than dropping the audit on the floor.)
-    before = benchmarks[0]["result"]
-    after = benchmarks[-1]["result"]
+    # Tier 1: full data path.
+    if len(benchmarks) >= 2 and patches:
+        latest_patch = patches[-1]["result"]
+        before = benchmarks[0]["result"]
+        after = benchmarks[-1]["result"]
+        return _call_compare_runs(latest_patch, before, after, " (auto-synthesized compare_runs)")
 
+    # Tier 2: patch + 1 benchmark — fill in the patched-side metrics from
+    # FakeRunner so the demo still produces a Report with a clear note.
+    if patches and len(benchmarks) == 1:
+        latest_patch = patches[-1]["result"]
+        before = benchmarks[0]["result"]
+        # Project the patched run via FakeRunner. The synthetic corpus has
+        # a `02_optimized` scenario the patched config typically matches.
+        from agent.schemas import WorkloadConfig
+        from runner.protocol import FakeRunner
+
+        try:
+            patched_cfg = WorkloadConfig.model_validate(latest_patch["new_config"])
+            after_metrics = FakeRunner().run(patched_cfg, steps=before.get("steps", 50))
+            after = after_metrics.model_dump()
+        except Exception:
+            return None
+        return _call_compare_runs(
+            latest_patch,
+            before,
+            after,
+            " (auto-synthesized; patched-side projected via FakeRunner)",
+        )
+
+    return None
+
+
+def _call_compare_runs(
+    patch: dict[str, Any],
+    before: dict[str, Any],
+    after: dict[str, Any],
+    suffix: str,
+) -> dict[str, Any] | None:
     workload_name = (
-        latest_patch.get("new_config", {}).get("model_name")
+        patch.get("new_config", {}).get("model_name")
         or "Audited Workload"
-    )
-    workload_name = f"{workload_name} (auto-synthesized compare_runs)"
-
+    ) + suffix
     result = tools_module.call(
         "compare_runs",
         workload_name=workload_name,
         before=before,
         after=after,
-        patch=latest_patch,
+        patch=patch,
     )
-    if not result.ok:
-        return None
-    return result.result
+    return result.result if result.ok else None
 
 
 def _safe_json(value: Any) -> str:

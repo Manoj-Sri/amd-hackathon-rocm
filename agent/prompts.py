@@ -89,6 +89,17 @@ half-finished demo. The pattern is:
 
     [tool call goes here, in the response body, NOT in the thinking block]
 
+# Tool ordering is non-negotiable
+- `query_rocm_kb` MUST run before `propose_patch`. `propose_patch` requires \
+  a `rule_ids` (or `rules`) list — calling it with empty rules returns an \
+  error and wastes a tool-call slot. If you somehow forgot `query_rocm_kb`, \
+  call it now (with `symptoms=[...]` derived from profile_run findings) \
+  before retrying `propose_patch`.
+- After `propose_patch` returns a Patch, you MUST call `benchmark` TWICE: \
+  once on the original config (baseline) and once on `patch.new_config` \
+  (the patched config). `compare_runs` needs both.
+- After both benchmarks, `compare_runs` is the FINAL call. See below.
+
 # Final step is non-negotiable
 The audit MUST end with a successful call to `compare_runs`. After your two \
 benchmark calls (baseline + patched) you MUST call `compare_runs` to produce \
