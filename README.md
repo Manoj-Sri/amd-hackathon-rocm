@@ -11,9 +11,11 @@ license: mit
 short_description: An AI agent that hunts wasted compute on AMD MI300X. Powered by Qwen.
 tags:
   - amd
+  - amd-hackathon-2026
   - mi300x
   - rocm
   - qwen
+  - vllm
   - huggingface
   - agent
   - fine-tuning
@@ -381,36 +383,53 @@ Application Platform + Application URL" submission fields.
 ### One-time setup
 
 1. Create a Hugging Face account at [huggingface.co](https://huggingface.co/)
-   and accept the invite to the **AMD Developer Hackathon HF Organization**
-   (link is on the [hackathon page](https://lablab.ai/ai-hackathons/amd-developer)
-   under the Hugging Face section).
+   and join the **`lablab-ai-amd-developer-hackathon`** HF Organization
+   ([direct link](https://huggingface.co/lablab-ai-amd-developer-hackathon)).
+   The Space MUST live under that org for the hackathon Special Prize and
+   for the lablab submission to validate.
 2. Create a token at [Settings → Access Tokens](https://huggingface.co/settings/tokens)
-   with **`write`** scope (you need write access to push to the Space repo).
-   Save it as `HF_PUSH_TOKEN`.
-3. On the HF organization's page, click **"New Space"**:
-   - Owner: AMD Developer Hackathon org
-   - Space name: `gpu-goblin` (or your preferred slug)
-   - License: MIT
-   - SDK: **Streamlit**
-   - Hardware: **CPU basic** (free; the Space loads no GPU code path)
-   - Visibility: Public
+   with **`write`** scope. Export it:
+   ```bash
+   export HF_TOKEN=hf_yourtokenhere
+   ```
+3. On the org's page, click **"New Space"**:
+   - **Owner:** `lablab-ai-amd-developer-hackathon`
+   - **Space name:** `gpu-goblin` (or your preferred slug)
+   - **License:** MIT
+   - **SDK:** **Streamlit**
+   - **Hardware:** **CPU basic** (free; the Space's offline-replay default
+     loads no GPU code path)
+   - **Visibility:** **Public** (required for the hackathon prize)
 4. Don't initialize the Space with anything — leave it empty so the first
    push lands cleanly.
 
-### Deploy
-
-From the project root, push the existing `feat/scaffold` branch to the
-Space's git remote:
+### Deploy — Option A: scripted upload via `huggingface_hub` (recommended)
 
 ```bash
-# Add the Space remote (use HTTPS with your username + HF_PUSH_TOKEN as password):
-git remote add space https://huggingface.co/spaces/<org-slug>/gpu-goblin
-
-# Push (HF Spaces use 'main' as the default branch):
-git push space feat/scaffold:main
+export HF_TOKEN=hf_...
+python scripts/deploy_to_hf_space.py --space-name gpu-goblin
 ```
 
-You'll see a build log at `https://huggingface.co/spaces/<org-slug>/gpu-goblin`.
+The script (`scripts/deploy_to_hf_space.py`) uses `HfApi.upload_file` to
+push exactly the files the Space needs (README, requirements.txt, the
+`agent/` package, `kb/`, `ui/`, the cached audit fixture, etc.) and
+deliberately omits build artifacts like `bench_cache/` and
+`__pycache__/` that would bloat the Space repo.
+
+### Deploy — Option B: git push (works but uploads everything tracked)
+
+From the project root:
+
+```bash
+# HTTPS remote — auth via your HF token (use the token as the password):
+git remote add space https://huggingface.co/spaces/lablab-ai-amd-developer-hackathon/gpu-goblin
+
+# HF Spaces use 'main' as the default branch:
+git push space main
+```
+
+You'll see a build log at
+`https://huggingface.co/spaces/lablab-ai-amd-developer-hackathon/gpu-goblin`.
 Cold-start takes 30-60 seconds (Streamlit + the pure-pydantic deps); once
 up, the canonical demo trajectory replays in ~10 seconds when a judge
 clicks **"Use sample workload"**.
@@ -433,30 +452,64 @@ When a judge opens the Space URL:
 
 ### Updating the Space
 
-After any change to the main repo, redeploy:
+After any change to the repo, redeploy with whichever flow you used initially:
 
 ```bash
-git push space feat/scaffold:main
+# Option A:
+python scripts/deploy_to_hf_space.py --space-name gpu-goblin
+
+# Option B:
+git push space main
 ```
 
-HF rebuilds the Space automatically on push.
+HF rebuilds the Space automatically on every push/upload.
 
 ### (Stretch) Live agent in the Space
 
-The shipped Space is read-only — it doesn't reach a real LLM. If you want
-judges to drive the agent live, two paths:
+The shipped Space defaults to offline-replay (no Space secrets needed).
+For a live demo where judges drive a real Qwen agent, three options:
 
-1. **Stand up the FastAPI backend somewhere reachable** (an MI300X on AMD
-   Developer Cloud, an HF Inference Endpoint, a small CPU box) and set the
-   Space's `GOBLIN_BACKEND_URL` secret to that URL. The Streamlit app will
-   stream real SSE from your backend instead of the cached replay.
-2. **Embed the agent loop in-process** (refactor `ui/app.py` to call
-   `agent.loop.run_audit` directly via `asyncio.run`). This adds
-   `huggingface_hub` to `requirements.txt` and requires `HF_TOKEN` as a
-   Space secret. Larger cold-start, fully self-contained.
+**Option 1 — In-process Qwen via HF Inference Providers (already wired)**
 
-Both are post-MVP; the offline-replay Space is what satisfies the
-submission requirement.
+Set these as Space **Settings → Variables and secrets**:
+
+| Secret | Value |
+|---|---|
+| `HF_TOKEN` | Your HF token with `inference` scope |
+| `GOBLIN_AGENT_BACKEND` | `qwen-hf` (default) |
+| `GOBLIN_QWEN_MODEL` | `Qwen/Qwen2.5-7B-Instruct` (or any HF Qwen model id) |
+
+After redeploying, the lane caption flips to `🟢 Live: agent runs Qwen
+in-process via Hugging Face Inference Providers` and judges audit live.
+
+**Option 2 — Connect to a self-hosted vLLM on your AMD droplet**
+
+If you've followed the AMD Developer Cloud tutorial and have vLLM serving
+Qwen on your MI300X at `http://YOUR_DROPLET_IP:8000/v1`, point the Space
+at it via Space secrets:
+
+| Secret | Value |
+|---|---|
+| `GOBLIN_AGENT_BACKEND` | `qwen-vllm` |
+| `GOBLIN_QWEN_VLLM_URL` | `http://YOUR_DROPLET_IP:8000/v1` |
+| `GOBLIN_QWEN_VLLM_MODEL` | The model ID vLLM advertises at `/v1/models` |
+
+**Important:** the AMD Developer Cloud droplet blocks port 8000 by default.
+SSH into the droplet and run `ufw allow 8000` (per the [lablab tutorial](https://lablab.ai/ai-tutorials/amd-huggingface-deployment-for-ai-hackathons))
+before the Space can reach the endpoint. Verify from outside:
+```bash
+curl -s http://YOUR_DROPLET_IP:8000/v1/models
+```
+
+**Option 3 — Connect to a separate FastAPI backend**
+
+If you've run `uvicorn agent.server:app` somewhere reachable (an MI300X on
+AMD Developer Cloud, an HF Inference Endpoint, a small CPU box), set
+`GOBLIN_BACKEND_URL` as a Space secret pointing at the `/audit` endpoint.
+Streamlit will stream real SSE from that backend.
+
+All three options are optional; the offline-replay Space is what
+satisfies the submission requirement.
 
 ## Configuration Reference
 
