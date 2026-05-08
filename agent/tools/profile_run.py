@@ -17,6 +17,17 @@ _RUNNER = _default_runner()
 
 
 def _profile_run(config: dict, steps: int = 10) -> ToolResult:
+    # Defensive: Qwen2.5-7B occasionally nests ``steps`` *inside* the config
+    # dict rather than at the top level. WorkloadConfig strict-validates so
+    # this would error out and burn a tool slot for nothing. Pull it back
+    # out, letting an explicit caller-supplied value win ties.
+    if isinstance(config, dict) and "steps" in config:
+        misnested = config.pop("steps")
+        if steps == 10 and misnested is not None:
+            try:
+                steps = int(misnested)
+            except (TypeError, ValueError):
+                pass
     workload = WorkloadConfig.model_validate(config)
     metrics = _RUNNER.run(workload, steps=steps)
     return ToolResult(ok=True, result=metrics.model_dump())

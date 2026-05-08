@@ -21,7 +21,14 @@ from agent.backends import Backend, ToolCall, make_backend
 from agent.prompts import SYSTEM_PROMPT
 from agent.schemas import SSEEvent
 
-MAX_STEPS = 8
+MAX_STEPS = 10
+"""Hard cap on tool calls per audit. The canonical trajectory is six calls
+(parse → profile → query_kb → patch → benchmark×2 → compare). The extra
+4 calls of headroom let the model recover from common mistakes (JSON
+nesting glitches, retry on ToolResult(ok=False)) without exhausting the
+budget before compare_runs. Was 8; bumped after a live run hit a wall when
+two misnested-arg benchmark retries ate the slack meant for compare_runs.
+"""
 MAX_TOKENS = 2048
 
 

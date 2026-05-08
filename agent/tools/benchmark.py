@@ -138,6 +138,25 @@ def _benchmark(
     Live-AMD-GPU lesson: the LLM tends to pass ``cache: true`` when it means
     "use the cache" — make that work directly.
     """
+    # Defensive: Qwen2.5-7B occasionally nests ``steps`` / ``cache`` /
+    # ``force_rerun`` *inside* the config dict instead of at the top level
+    # alongside it. WorkloadConfig strict-validates extras, so the call
+    # would error out and waste a tool slot. Extract them back to the
+    # top-level args, with the caller's explicit values winning ties.
+    if isinstance(config, dict):
+        misnested_steps = config.pop("steps", None)
+        misnested_cache = config.pop("cache", None)
+        misnested_force = config.pop("force_rerun", None)
+        if misnested_steps is not None and steps == 50:
+            try:
+                steps = int(misnested_steps)
+            except (TypeError, ValueError):
+                pass
+        if misnested_cache is not None and cache is True:
+            cache = bool(misnested_cache)
+        if misnested_force is not None and force_rerun is None:
+            force_rerun = bool(misnested_force)
+
     if force_rerun is not None:
         # Explicit force_rerun overrides cache; legacy callers keep working.
         use_cache = not force_rerun
