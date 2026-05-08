@@ -16,6 +16,12 @@
 # runnable, ROCm warns on the launch serialization. AST parse is fine.
 
 import os
+import sys
+import time
+
+sys.path.insert(
+    0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+)
 
 import torch
 import torch.nn as nn
@@ -28,6 +34,10 @@ from transformers import (
     Trainer,
     TrainingArguments,
 )
+
+from workloads._runtime import emit_torch_profile, parse_runtime_args
+
+_runtime = parse_runtime_args()
 
 os.environ["HF_TOKEN"] = "hf_aaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 HF_TOKEN = os.environ["HF_TOKEN"]
@@ -69,7 +79,7 @@ train_loader = DataLoader(
     persistent_workers=True,
 )
 
-training_args = TrainingArguments(
+_ta_kwargs = dict(
     output_dir="./out",
     per_device_train_batch_size=8,
     gradient_accumulation_steps=4,
@@ -88,6 +98,10 @@ training_args = TrainingArguments(
     report_to="none",
     push_to_hub=False,
 )
+if _runtime.max_steps > 0:
+    _ta_kwargs["max_steps"] = _runtime.max_steps
+    _ta_kwargs["num_train_epochs"] = 1
+training_args = TrainingArguments(**_ta_kwargs)
 
 trainer = Trainer(
     model=model,
@@ -97,4 +111,13 @@ trainer = Trainer(
 )
 
 if __name__ == "__main__":
+    _t0 = time.time()
     trainer.train()
+    emit_torch_profile(
+        _runtime.torch_profile_out,
+        elapsed=time.time() - _t0,
+        n_steps=int(getattr(trainer.state, "global_step", 0) or _runtime.max_steps),
+        per_device_batch=training_args.per_device_train_batch_size,
+        grad_accum=training_args.gradient_accumulation_steps,
+        seq_len_cap=512,
+    )

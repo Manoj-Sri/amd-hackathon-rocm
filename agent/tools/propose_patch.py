@@ -45,6 +45,18 @@ from agent.tools import Tool
 from agent.tools.query_rocm_kb import _RULES as _KB_RULES
 
 
+# Module-level cache of the most recent successful Patch. ``compare_runs``
+# reads this when the LLM forwards a malformed ``patch=`` argument — a
+# common Qwen failure mode where the model collapses the Patch dict down
+# to its ``new_config`` fields. See ``compare_runs._normalize_patch``.
+_LAST_PATCH: dict[str, Any] | None = None
+
+
+def latest_patch() -> dict[str, Any] | None:
+    """Return the most recent Patch dict produced by propose_patch, or None."""
+    return _LAST_PATCH
+
+
 # ---------------------------------------------------------------------------
 # Rule resolution
 # ---------------------------------------------------------------------------
@@ -242,6 +254,9 @@ def _propose_patch(
     notes = cfg_warnings + rule_warnings
     if notes:
         payload["notes"] = notes
+    # Cache so compare_runs can recover from LLM truncation.
+    global _LAST_PATCH
+    _LAST_PATCH = payload
     return ToolResult(ok=True, result=payload)
 
 

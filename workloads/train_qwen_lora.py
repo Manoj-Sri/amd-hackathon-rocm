@@ -12,6 +12,12 @@
 #   - memory.batch_too_small_for_192gb     (per_device_train_batch_size=4)
 
 import os
+import sys
+import time
+
+# Bootstrap the repo root onto sys.path so `from workloads._runtime import ...`
+# works regardless of where the script is invoked from.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 from datasets import load_dataset
@@ -23,6 +29,11 @@ from transformers import (
     Trainer,
     TrainingArguments,
 )
+
+from workloads._runtime import emit_torch_profile, parse_runtime_args
+
+# Parse the goblin_runner.sh injected flags (--max_steps, --torch_profile_out).
+_runtime = parse_runtime_args()
 
 # A redactable secret so parse_config has something to scrub during the demo.
 os.environ["HF_TOKEN"] = "hf_aaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -70,7 +81,7 @@ train_loader = DataLoader(
     persistent_workers=False,
 )
 
-training_args = TrainingArguments(
+_ta_kwargs = dict(
     output_dir="./out",
     per_device_train_batch_size=4,        # leaves HBM on the floor at 192 GB
     gradient_accumulation_steps=8,
@@ -94,6 +105,14 @@ training_args = TrainingArguments(
     # bearing on the audit's findings.
     remove_unused_columns=False,
 )
+# Honor the --max_steps arg so goblin_runner.sh's 10-step / 50-step
+# requests actually short-circuit training (rather than running for hours
+# and tripping LiveRunner's timeout).
+if _runtime.max_steps > 0:
+    _ta_kwargs["max_steps"] = _runtime.max_steps
+    _ta_kwargs["num_train_epochs"] = 1  # compatibility — max_steps wins anyway
+
+training_args = TrainingArguments(**_ta_kwargs)
 
 
 # Tiny collator turning the alpaca rows into input_ids / labels so the
@@ -126,5 +145,20 @@ trainer = Trainer(
     data_collator=_toy_collate,
 )
 
+
 if __name__ == "__main__":
+    _t0 = time.time()
     trainer.train()
+    _elapsed = time.time() - _t0
+    # trainer.state.global_step is the actual number of optimization steps
+    # (honors max_steps); fall back to the runtime arg if the trainer
+    # bailed before bumping it.
+    _n_steps = int(getattr(trainer.state, "global_step", 0) or _runtime.max_steps)
+    emit_torch_profile(
+        _runtime.torch_profile_out,
+        elapsed=_elapsed,
+        n_steps=_n_steps,
+        per_device_batch=training_args.per_device_train_batch_size,
+        grad_accum=training_args.gradient_accumulation_steps,
+        seq_len_cap=512,
+    )

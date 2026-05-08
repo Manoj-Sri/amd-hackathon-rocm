@@ -236,9 +236,14 @@ class LiveRunner:
         self,
         runner_script: Path | str = _DEFAULT_RUNNER_SCRIPT,
         user_script: Path | str = _DEFAULT_USER_SCRIPT,
-        timeout_seconds: int = 1800,
+        timeout_seconds: int = 600,
         fake_fallback: FakeRunner | None = None,
     ) -> None:
+        # Default 600s (10 min). Profile runs (10 steps) finish in seconds
+        # on a healthy MI300X; benchmarks (50 steps) in a couple of minutes.
+        # 30 minutes was a leftover from a workload that wasn't honoring
+        # --max_steps and silently trained for hours. With max_steps wired
+        # correctly, 600s is generous.
         self.runner_script = Path(runner_script)
         self.user_script = Path(user_script)
         self.timeout_seconds = timeout_seconds
