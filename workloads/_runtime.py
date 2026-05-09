@@ -146,12 +146,20 @@ def transformers_attention_impl(override: str | None, default: str) -> str:
     - ``override`` is one of the agent's semantic names: returns the
       transformers-canonical equivalent.
     - ``override`` is already a transformers-canonical name: passes through.
-
-    Examples:
-        transformers_attention_impl(None, "eager")          → "eager"
-        transformers_attention_impl("flash_rocm", "eager")  → "flash_attention_2"
-        transformers_attention_impl("sdpa", "eager")        → "sdpa"
+    - ``GOBLIN_PATCH_SAFE_ONLY=1``: ignores any override and returns ``default``,
+      so attention_impl stays at the workload's static literal. SDPA can still
+      hit kernel paths that crash on wheel/runtime mismatches; this flag
+      keeps GPU compute paths untouched while letting dataloader/etc.
+      overrides through.
     """
+    if _safe_overrides_only():
+        if override:
+            print(
+                f"[goblin-patch] GOBLIN_PATCH_SAFE_ONLY=1 — keeping "
+                f"attention_impl={default!r} (override {override!r} skipped)",
+                flush=True,
+            )
+        return default
     if not override:
         return default
     return _TRANSFORMERS_ATTN_NAME_MAP.get(override, override)
@@ -181,6 +189,27 @@ def read_patch_overrides() -> PatchOverrides:
     )
 
 
+def _safe_overrides_only() -> bool:
+    """Demo escape hatch: when ``GOBLIN_PATCH_SAFE_ONLY=1``, apply only the
+    overrides that don't touch GPU compute paths.
+
+    Some MI300X environments have torch wheel ↔ ROCm runtime mismatches
+    (e.g. torch+rocm6.2 wheel running against a ROCm 7.x system runtime)
+    where bf16 conversion or non-eager attention crashes mid-training with
+    "Memory access fault by GPU node-1". The patch's dataloader fields
+    (workers / pin_memory / persistent_workers / batch_size) are pure
+    host-side changes and survive the mismatch fine — they just hide
+    tokenization behind GPU compute. With this flag set, dtype conversion
+    and attention_impl reassignment are skipped, but dataloader / env_var
+    overrides still apply. Lets the patched benchmark complete cleanly
+    while still showing measurable lift from the pieces that work.
+
+    Default is off — the agent's full patch applies. Enable with:
+        export GOBLIN_PATCH_SAFE_ONLY=1
+    """
+    return _bool_env("GOBLIN_PATCH_SAFE_ONLY") is True
+
+
 def apply_overrides_to_model_dtype(model, overrides: PatchOverrides):
     """Convert a loaded model to the patched dtype if the override differs.
 
@@ -192,8 +221,21 @@ def apply_overrides_to_model_dtype(model, overrides: PatchOverrides):
     ``from_pretrained`` call site and reports ``precision="fp16"``. This
     function applies the override AFTER load — invisible to parse_config but
     real for the running model.
+
+    Skipped when ``GOBLIN_PATCH_SAFE_ONLY=1`` is set in the environment —
+    see ``_safe_overrides_only`` for the rationale.
     """
     import torch
+
+    if _safe_overrides_only():
+        if overrides.precision is not None:
+            print(
+                f"[goblin-patch] GOBLIN_PATCH_SAFE_ONLY=1 — skipping "
+                f"precision={overrides.precision!r} override (dtype "
+                f"conversion can crash on wheel/runtime mismatched setups)",
+                flush=True,
+            )
+        return model
 
     if overrides.precision is None:
         return model
@@ -240,13 +282,26 @@ def apply_overrides_to_training_args(training_args, overrides: PatchOverrides) -
     swapping the runtime values.
 
     No-op for any override that's None.
+
+    When ``GOBLIN_PATCH_SAFE_ONLY=1`` is set, the precision override is
+    skipped (TrainingArguments fp16/bf16 booleans untouched) — bf16 has
+    been observed to crash mid-training on wheel/runtime mismatched
+    MI300X setups. Dataloader / batch_size / etc. overrides still apply.
     """
+    safe_only = _safe_overrides_only()
+
     # Precision booleans on TrainingArguments are a tri-state: fp16/bf16/tf32.
     # Set the active one True and the others False rather than only flipping
     # one — defends against the case where the workload's literal has
     # ``fp16=True`` and the override switches to ``bf16=True`` while still
     # leaving ``fp16=True`` (HF would log a warning and pick one).
-    if overrides.precision == "bf16":
+    if safe_only and overrides.precision is not None:
+        print(
+            f"[goblin-patch] GOBLIN_PATCH_SAFE_ONLY=1 — skipping "
+            f"precision={overrides.precision!r} override on training_args",
+            flush=True,
+        )
+    elif overrides.precision == "bf16":
         training_args.fp16 = False
         training_args.bf16 = True
         if hasattr(training_args, "tf32"):
