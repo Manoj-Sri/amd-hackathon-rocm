@@ -82,16 +82,20 @@ async def _stream_audit(file_path: str) -> AsyncIterator[dict]:
     sse-starlette expects. Each yielded dict becomes one `data: ...\\n\\n`
     SSE message.
     """
-    if not _has_hf_token():
-        # Surface a clean error instead of letting the loop crash on missing key.
+    # Backend-aware credential check. Only `qwen-hf` (HF Inference Providers)
+    # needs HF_TOKEN; `qwen-vllm` talks to a self-hosted endpoint and ignores
+    # tokens by default. Without this guard the server unconditionally errored
+    # when HF_TOKEN was unset, even though the active backend didn't need it.
+    if active_backend_name() == "qwen-hf" and not _has_hf_token():
         yield {
             "data": SSEEvent(
                 type="error",
                 data={
                     "message": (
-                        "HF_TOKEN not set on the server — Qwen agent loop is "
-                        "unavailable. Set HF_TOKEN (or HUGGINGFACEHUB_API_TOKEN) "
-                        "or use the offline-replay UI lane."
+                        "HF_TOKEN not set on the server — Qwen-HF agent loop is "
+                        "unavailable. Set HF_TOKEN (or HUGGINGFACEHUB_API_TOKEN), "
+                        "switch GOBLIN_AGENT_BACKEND to qwen-vllm, or use the "
+                        "offline-replay UI lane."
                     )
                 },
             ).model_dump_json()
