@@ -68,6 +68,7 @@ DEFAULT_SPACE_NAME = "gpu-goblin"
 FILES_TO_UPLOAD: list[str] = [
     # --- Space metadata + entry point ---
     "README.md",
+    "Dockerfile",          # HF Space SDK = docker (Streamlit runs inside)
     "requirements.txt",
     "ui/__init__.py",
     "ui/app.py",

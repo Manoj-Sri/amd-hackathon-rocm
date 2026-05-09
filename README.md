@@ -3,9 +3,8 @@ title: GPU Goblin
 emoji: 🧌
 colorFrom: red
 colorTo: red
-sdk: streamlit
-sdk_version: "1.32.0"
-app_file: ui/app.py
+sdk: docker
+app_port: 7860
 pinned: false
 license: mit
 short_description: An AI agent that hunts wasted compute on AMD MI300X. Powered by Qwen.
