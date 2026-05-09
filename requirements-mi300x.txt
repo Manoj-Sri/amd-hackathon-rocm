@@ -1,0 +1,39 @@
+# GPU Goblin — MI300X workload subprocess deps.
+#
+# This file fits between two other requirements lists:
+#
+#   * requirements.txt             — Hugging Face Space (Streamlit + light
+#                                    agent only; no torch/transformers).
+#   * pyproject.toml [project]     — agent loop runtime (FastAPI, uvicorn,
+#                                    sentence-transformers, etc.).
+#   * requirements-mi300x.txt      — THIS FILE: workload subprocess deps
+#                                    that train_qwen_lora.py and the
+#                                    scenarios under workloads/scenarios/
+#                                    import directly.
+#
+# Notably absent: `torch`.
+#
+#   The MI300X instance image (typically rocm/pytorch:rocm<X.Y>_ubuntu*_
+#   pytorch_*) ships a torch wheel built against the matching ROCm
+#   runtime. Pinning `torch` here would invite pip to resolve from the
+#   default PyPI index and silently overwrite that wheel with a CUDA
+#   build — exactly the failure mode that nuked the live audit pipeline
+#   on this project's first integration. Let the container's preinstalled
+#   torch be the source of truth and run `scripts/setup_mi300x.sh` to
+#   sanity-check it before running the agent.
+#
+# Notably absent: `bitsandbytes`.
+#
+#   The `train_qwen_bnb.py` scenario references it indirectly (via
+#   transformers' `load_in_8bit=True` / `optim="paged_adamw_8bit"`) but
+#   that scenario is *intentionally* designed to demonstrate failure on
+#   ROCm. Install bitsandbytes manually if you want to demo the bnb
+#   scenario; the canonical `train_qwen_lora.py` audit doesn't need it.
+
+datasets>=2.18
+peft>=0.10
+# transformers ≥4.46 introduces `processing_class=` (Trainer) and `dtype=`
+# (from_pretrained). Workloads have a runtime shim that accepts both names,
+# but pinning the floor at 4.46 keeps the deprecation warnings predictable.
+transformers>=4.46
+accelerate>=0.30

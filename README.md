@@ -146,7 +146,20 @@ cd /workspace
 git clone https://github.com/Manoj-Sri/amd-hackathon-rocm.git goblin
 cd goblin
 
-pip install -e ".[dev]"
+# One-shot setup: pre-flights torch+ROCm, installs workload + agent deps,
+# post-flights with a GPU matmul. Catches the two silent-fail traps that
+# bit this project repeatedly — a CUDA torch wheel sneaking in via pip
+# resolution, and a container missing /dev/kfd passthrough.
+bash scripts/setup_mi300x.sh
+
+# (What that script does, for the curious:)
+#   pip install -r requirements-mi300x.txt  # datasets, peft, transformers,
+#                                           # accelerate — NOT torch
+#   pip install -e .                         # agent + runner deps from
+#                                           # pyproject.toml
+# `torch` is intentionally absent from requirements-mi300x.txt so pip
+# doesn't clobber the ROCm wheel that ships in the container.
+
 python -m pytest tests/ -q              # 86 tests pass without GPU; faster sanity check
 
 # Live run on MI300X:
