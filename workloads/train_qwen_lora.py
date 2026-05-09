@@ -37,6 +37,7 @@ from workloads._runtime import (
     parse_runtime_args,
     read_patch_overrides,
     trainer_tokenizer_kwargs,
+    transformers_attention_impl,
 )
 
 # Parse the goblin_runner.sh injected flags (--max_steps, --torch_profile_out).
@@ -66,8 +67,13 @@ MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
 # assignment so parse_config doesn't see it; the static view stays "eager"
 # and only the live process sees the override.
 ATTENTION_IMPL = "eager"  # naive attention -- goblin should swap to flash_rocm
-if _patch_overrides.attention_impl:
-    ATTENTION_IMPL = _patch_overrides.attention_impl
+# Translate the agent's KB-vocabulary override into transformers' canonical
+# name: "flash_rocm" → "flash_attention_2", "flash" → "flash_attention_2",
+# others pass through. Without this, transformers raises
+# `ValueError: Specified attn_implementation="flash_rocm" is not supported`.
+ATTENTION_IMPL = transformers_attention_impl(
+    _patch_overrides.attention_impl, ATTENTION_IMPL
+)
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, token=HF_TOKEN)
 model = AutoModelForCausalLM.from_pretrained(

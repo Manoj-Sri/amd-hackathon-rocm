@@ -106,6 +106,43 @@ def _bool_env(name: str) -> bool | None:
     return None
 
 
+# Map the agent's KB-vocabulary attention_impl names to the names
+# transformers' from_pretrained actually validates against. The KB uses
+# "flash_rocm" as a semantic tag — "the ROCm-validated flash attention" —
+# while transformers itself only knows the version-suffixed canonical names
+# ("flash_attention_2" / "flash_attention_3"); the underlying library
+# (FlashAttn, Optimum-AMD, etc.) figures out CUDA vs ROCm at load time.
+# Without this translation, applying a patch with attention_impl=flash_rocm
+# would fail at from_pretrained with:
+#   ValueError: Specified `attn_implementation="flash_rocm"` is not supported.
+_TRANSFORMERS_ATTN_NAME_MAP: dict[str, str] = {
+    "flash_rocm": "flash_attention_2",
+    "flash": "flash_attention_2",
+    # eager / sdpa / flex_attention / flash_attention_2 / flash_attention_3
+    # pass through unchanged.
+}
+
+
+def transformers_attention_impl(override: str | None, default: str) -> str:
+    """Resolve the agent's attention_impl override to a transformers-canonical
+    name.
+
+    - ``override is None`` or empty: returns ``default`` (the workload's
+      static literal — what parse_config sees and the agent reasons over).
+    - ``override`` is one of the agent's semantic names: returns the
+      transformers-canonical equivalent.
+    - ``override`` is already a transformers-canonical name: passes through.
+
+    Examples:
+        transformers_attention_impl(None, "eager")          → "eager"
+        transformers_attention_impl("flash_rocm", "eager")  → "flash_attention_2"
+        transformers_attention_impl("sdpa", "eager")        → "sdpa"
+    """
+    if not override:
+        return default
+    return _TRANSFORMERS_ATTN_NAME_MAP.get(override, override)
+
+
 def read_patch_overrides() -> PatchOverrides:
     """Read ``GOBLIN_PATCH_*`` env vars set by ``LiveRunner.run`` so the
     workload subprocess can apply the agent's proposed patch at runtime.
