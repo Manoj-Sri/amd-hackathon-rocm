@@ -440,11 +440,22 @@ class LiveRunner:
                     f"LiveRunner: failed to spawn goblin_runner.sh ({exc}); using FakeRunner.",
                 )
 
-            if proc.returncode != 0:
-                # Archive the full out_dir to bench_cache/last_runner_failure_<ts>/
-                # so the user can inspect stdout.log / stderr.log / amd_smi.err
-                # after the tempdir cleanup. The path goes into the warning
-                # message so it's surfaced through ToolResult.warnings.
+            # The workload's success signal is "did it write a non-trivial
+            # torch_profile.json?". When rocprofv3 SIGABRTs in finalization
+            # (a known issue under torch wheel ↔ ROCm runtime mismatches: the
+            # workload trains all 50 steps cleanly, writes its profile, then
+            # rocprofv3's tool teardown crashes), goblin_runner.sh propagates
+            # a non-zero exit code even though the real metrics are sitting
+            # right there. Don't throw away real data — if the profile is
+            # present, parse it. Only fall back to FakeRunner when the
+            # workload itself didn't produce output.
+            profile_path = out_dir / "torch_profile.json"
+            profile_recoverable = (
+                profile_path.exists() and profile_path.stat().st_size > 10
+            )
+
+            if proc.returncode != 0 and not profile_recoverable:
+                # Real failure — workload didn't even write a profile.
                 archive_path = _archive_failure(out_dir, proc)
                 stderr_tail = (proc.stderr or "").strip().splitlines()[-15:]
                 stdout_tail = (proc.stdout or "").strip().splitlines()[-5:]
@@ -452,10 +463,28 @@ class LiveRunner:
                     config,
                     steps,
                     "LiveRunner: goblin_runner.sh exited with "
-                    f"code {proc.returncode}; using FakeRunner. "
+                    f"code {proc.returncode} and no torch_profile.json was "
+                    "produced; using FakeRunner. "
                     f"Failure logs archived at {archive_path}. "
                     f"stderr tail: {stderr_tail}. "
                     f"stdout tail: {stdout_tail}.",
+                )
+
+            recovered_from_finalizer_crash = (
+                proc.returncode != 0 and profile_recoverable
+            )
+            if recovered_from_finalizer_crash:
+                # Archive for forensics but keep going — we have real data.
+                archive_path = _archive_failure(out_dir, proc)
+                _LOG.warning(
+                    "LiveRunner: goblin_runner.sh exited %d but "
+                    "torch_profile.json is present (%d bytes). Most likely "
+                    "rocprofv3's finalizer SIGABRT'd after the workload "
+                    "completed. Recovering real metrics from the profile. "
+                    "Failure logs archived at %s.",
+                    proc.returncode,
+                    profile_path.stat().st_size,
+                    archive_path,
                 )
 
             try:
@@ -469,6 +498,15 @@ class LiveRunner:
                 )
 
             metrics.runner_kind = "live"
+            if recovered_from_finalizer_crash:
+                # Surface the recovery to upstream tools so the report can
+                # note that finalization crashed (numbers are still real).
+                metrics.warnings = [
+                    f"LiveRunner: goblin_runner.sh exit {proc.returncode} "
+                    "during rocprofv3 finalizer; metrics recovered from "
+                    "torch_profile.json (workload itself completed cleanly).",
+                    *metrics.warnings,
+                ]
             return metrics
 
     # ------------------------------------------------------------------
