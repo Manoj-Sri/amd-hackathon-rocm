@@ -18,6 +18,14 @@ ENV STREAMLIT_SERVER_ADDRESS=0.0.0.0 \
     STREAMLIT_SERVER_PORT=7860 \
     STREAMLIT_BROWSER_GATHER_USAGE_STATS=false \
     STREAMLIT_SERVER_HEADLESS=true \
+    # HF Spaces serves Streamlit inside an iframe at *.hf.space while the
+    # parent page lives at huggingface.co/spaces. The browser drops Streamlit's
+    # XSRF cookie on cross-origin XHRs, so st.file_uploader gets a 403 from
+    # /_stcore/upload_file (surfaces in the UI as `AxiosError 403`). CORS
+    # check has the same root cause. Disable both — there's no untrusted
+    # origin in this deployment shape anyway.
+    STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION=false \
+    STREAMLIT_SERVER_ENABLE_CORS=false \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
