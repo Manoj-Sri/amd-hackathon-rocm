@@ -123,7 +123,9 @@ def _call_name(node: ast.Call) -> str:
 
 
 def _kwargs_to_dict(
-    node: ast.Call, dict_constants: dict[str, dict[str, Any]] | None = None
+    node: ast.Call,
+    dict_constants: dict[str, dict[str, Any]] | None = None,
+    constants: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Pull literal kwargs out of a Call.
 
@@ -133,9 +135,20 @@ def _kwargs_to_dict(
     ``_ta = dict(...); TrainingArguments(**_ta)`` — if the parser doesn't
     follow the splat, every TrainingArguments field disappears and the agent
     reasons over HF defaults instead of the script's actual values.
+
+    ``constants`` (optional) is the top-level ``NAME = literal`` table from
+    pass 1. When a kwarg's value is a bare ``Name``, we fall back to that
+    table — needed so workloads can keep parse_config-friendly literals while
+    still threading runtime patch overrides through a sentinel module-level
+    variable. Example: ``ATTENTION_IMPL = "eager"; from_pretrained(attn_implementation=ATTENTION_IMPL)``
+    — the literal "eager" lives at the top of the module (visible to the
+    extractor), while the workload's runtime can reassign ATTENTION_IMPL
+    before the call site to apply a patched value. Without this fallback,
+    that pattern silently drops attention_impl to ``unknown``.
     """
     out: dict[str, Any] = {}
     dict_constants = dict_constants or {}
+    constants = constants or {}
     for kw in node.keywords:
         if kw.arg is None:
             # `**something` splat. If something is a Name that resolves to a
@@ -148,6 +161,11 @@ def _kwargs_to_dict(
                         out.setdefault(k, v)
             continue
         val = _literal(kw.value)
+        # Fall back to the module-level constants table for bare Name
+        # references. Lets workloads parametrize literals through a sentinel
+        # variable without breaking parse_config's extraction.
+        if val is None and isinstance(kw.value, ast.Name):
+            val = constants.get(kw.value.id)
         if val is not None or isinstance(kw.value, ast.Constant):
             out[kw.arg] = val
     return out
@@ -329,11 +347,11 @@ def _extract_from_python(source: str) -> tuple[dict[str, Any], dict[str, Any]]:
             short = name.rsplit(".", 1)[-1] if name else ""
 
             if short in ("TrainingArguments", "Seq2SeqTrainingArguments"):
-                kw = _kwargs_to_dict(node, dict_constants)
+                kw = _kwargs_to_dict(node, dict_constants, constants)
                 raw_training_args.update(kw)
 
             elif short == "DataLoader":
-                kw = _kwargs_to_dict(node, dict_constants)
+                kw = _kwargs_to_dict(node, dict_constants, constants)
                 _apply_kwargs(payload, kw, extras, _DATALOADER_MAP)
 
             elif name == "torch.compile" or (
@@ -352,13 +370,13 @@ def _extract_from_python(source: str) -> tuple[dict[str, Any], dict[str, Any]]:
                     val = _arg_value(node.args[0])
                     if isinstance(val, str) and "model_name" not in payload:
                         payload["model_name"] = val
-                kw = _kwargs_to_dict(node)
+                kw = _kwargs_to_dict(node, constants=constants)
                 attn = _coerce_attention(kw)
                 if attn:
                     payload["attention_impl"] = attn
 
             elif short == "LoraConfig":
-                kw = _kwargs_to_dict(node)
+                kw = _kwargs_to_dict(node, constants=constants)
                 if "r" in kw and isinstance(kw["r"], int):
                     payload["lora_rank"] = kw["r"]
                 for k, v in kw.items():

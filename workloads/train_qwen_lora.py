@@ -31,13 +31,22 @@ from transformers import (
 )
 
 from workloads._runtime import (
+    apply_overrides_to_model_dtype,
+    apply_overrides_to_training_args,
     emit_torch_profile,
     parse_runtime_args,
+    read_patch_overrides,
     trainer_tokenizer_kwargs,
 )
 
 # Parse the goblin_runner.sh injected flags (--max_steps, --torch_profile_out).
 _runtime = parse_runtime_args()
+
+# Read GOBLIN_PATCH_* env vars set by LiveRunner so the agent's proposed
+# patch can actually take effect. None when this script is run standalone or
+# during a baseline benchmark; populated when LiveRunner is invoking us with
+# a patched WorkloadConfig.
+_patch_overrides = read_patch_overrides()
 
 # A redactable secret so parse_config has something to scrub during the demo.
 os.environ["HF_TOKEN"] = "hf_aaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -49,13 +58,30 @@ os.environ["MIOPEN_FIND_MODE"] = "3"
 
 MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
 
+# Top-level constant so parse_config's pass-1 constants table picks it up; the
+# `attn_implementation=ATTENTION_IMPL` kwarg below is then resolved via that
+# table (parse_config now follows Name→constant references in kwargs). At
+# runtime we may reassign this to the agent's patched value before the
+# from_pretrained call — that reassignment isn't a top-level Name=literal
+# assignment so parse_config doesn't see it; the static view stays "eager"
+# and only the live process sees the override.
+ATTENTION_IMPL = "eager"  # naive attention -- goblin should swap to flash_rocm
+if _patch_overrides.attention_impl:
+    ATTENTION_IMPL = _patch_overrides.attention_impl
+
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, token=HF_TOKEN)
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
     torch_dtype=torch.float16,
-    attn_implementation="eager",  # naive attention -- goblin should swap to flash_rocm
+    attn_implementation=ATTENTION_IMPL,
     token=HF_TOKEN,
 )
+
+# Apply dtype override after load. parse_config sees torch.float16 above and
+# reports precision="fp16"; the agent's patch may have requested bf16, in
+# which case `apply_overrides_to_model_dtype` does an in-place .to(dtype)
+# conversion. No-op when the override is unset or matches current dtype.
+model = apply_overrides_to_model_dtype(model, _patch_overrides)
 
 # LoRA — rank 16, attached to attention projections.
 lora_config = LoraConfig(
@@ -122,6 +148,15 @@ training_args = TrainingArguments(
     # max_steps=-1 as "use num_train_epochs"):
     max_steps=_RUNTIME_MAX_STEPS,
 )
+
+# Apply patch overrides AFTER TrainingArguments construction. parse_config
+# walks the AST and reads the literal kwargs above to derive the baseline
+# WorkloadConfig — those literals stay as the static view of the workload's
+# default. The override mutates the running TrainingArguments object so the
+# patched benchmark actually trains with bf16, more dataloader workers, etc.
+# parse_config doesn't watch attribute mutations, which is the property we
+# want here: the file describes the BASELINE; runtime applies the PATCH.
+apply_overrides_to_training_args(training_args, _patch_overrides)
 
 
 # Tiny collator turning the alpaca rows into input_ids / labels so the

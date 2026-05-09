@@ -222,6 +222,82 @@ def _archive_failure(out_dir: Path, proc: subprocess.CompletedProcess) -> Path:
     return dest
 
 
+def _config_to_patch_env(config: WorkloadConfig) -> dict[str, str]:
+    """Translate WorkloadConfig fields into ``GOBLIN_PATCH_*`` env vars that
+    the workload subprocess reads via ``workloads._runtime.read_patch_overrides``.
+
+    This is the mechanism that makes ``benchmark(config=patched_config)``
+    actually run with the patched config instead of running the workload's
+    hardcoded values twice. Each field whose value differs from the
+    ``WorkloadConfig`` schema default flows through as one env var; fields
+    matching the default are SKIPPED so we don't accidentally clobber a
+    workload's actual literal in the case where parse_config failed to
+    extract that field (config would then carry the schema default, not the
+    workload's real value, and emitting it would force the workload to a
+    wrong setting).
+
+    Returned mapping is always string→string for direct insertion into
+    ``subprocess.run(env=...)``.
+    """
+    # Schema-default reference. We compare against this to decide whether to
+    # emit an override — a field at its default likely wasn't extracted, and
+    # silencing it lets the workload's actual literal stand.
+    schema_default = WorkloadConfig(model_name="__goblin_default_marker__")
+
+    patch_env: dict[str, str] = {}
+
+    if config.precision and config.precision != schema_default.precision:
+        patch_env["GOBLIN_PATCH_PRECISION"] = str(config.precision)
+    if (
+        config.attention_impl
+        and config.attention_impl != schema_default.attention_impl
+    ):
+        patch_env["GOBLIN_PATCH_ATTENTION_IMPL"] = str(config.attention_impl)
+    if (
+        config.batch_size is not None
+        and config.batch_size != schema_default.batch_size
+    ):
+        patch_env["GOBLIN_PATCH_BATCH_SIZE"] = str(config.batch_size)
+    if (
+        config.grad_accum_steps is not None
+        and config.grad_accum_steps != schema_default.grad_accum_steps
+    ):
+        patch_env["GOBLIN_PATCH_GRAD_ACCUM_STEPS"] = str(config.grad_accum_steps)
+    if (
+        config.dataloader_workers is not None
+        and config.dataloader_workers != schema_default.dataloader_workers
+    ):
+        patch_env["GOBLIN_PATCH_DATALOADER_WORKERS"] = str(config.dataloader_workers)
+    if (
+        config.dataloader_pin_memory is not None
+        and config.dataloader_pin_memory != schema_default.dataloader_pin_memory
+    ):
+        patch_env["GOBLIN_PATCH_DATALOADER_PIN_MEMORY"] = str(
+            config.dataloader_pin_memory
+        ).lower()
+    if (
+        config.dataloader_persistent_workers is not None
+        and config.dataloader_persistent_workers
+        != schema_default.dataloader_persistent_workers
+    ):
+        patch_env["GOBLIN_PATCH_DATALOADER_PERSISTENT_WORKERS"] = str(
+            config.dataloader_persistent_workers
+        ).lower()
+    if (
+        config.gradient_checkpointing is not None
+        and config.gradient_checkpointing != schema_default.gradient_checkpointing
+    ):
+        patch_env["GOBLIN_PATCH_GRADIENT_CHECKPOINTING"] = str(
+            config.gradient_checkpointing
+        ).lower()
+    if (
+        config.torch_compile is not None
+        and config.torch_compile != schema_default.torch_compile
+    ):
+        patch_env["GOBLIN_PATCH_TORCH_COMPILE"] = str(config.torch_compile).lower()
+    return patch_env
+
+
 def _default_runner_timeout_seconds() -> int:
     """Resolve the LiveRunner subprocess timeout from env, with safe defaults.
 
@@ -330,6 +406,15 @@ class LiveRunner:
             env["USER_SCRIPT"] = str(self.user_script)
             env["OUT_DIR"] = str(out_dir)
             env["STEPS"] = str(steps)
+            # Inject patch-override env vars so the workload subprocess can
+            # actually apply the agent's proposed config (precision, attention
+            # impl, dataloader settings, etc.) — without this, benchmark calls
+            # with different `config` arguments produced identical results
+            # because the workload script hardcoded its values and ignored the
+            # `config` parameter entirely. See workloads/_runtime.py
+            # `read_patch_overrides` for the consumer side.
+            for var, value in _config_to_patch_env(config).items():
+                env[var] = value
 
             cmd = [str(self.runner_script)]
             try:
