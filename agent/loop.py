@@ -138,6 +138,54 @@ def _safe_json(value: Any) -> str:
         return str(value)
 
 
+# Trim Tensile-generated rocBLAS / kernel-trace names to a leading identifier.
+# 60 chars keeps `Cijk_Alik_Bljk_HHS_BH_Bias_HA_S_SAV_UserArgs_MT256x192x64_M…`
+# enough to identify the kernel family but drops the 150+ chars of compiled
+# tile-config suffixes that don't help the LLM reason and balloon its context.
+_LLM_KERNEL_NAME_MAX = 60
+# Top-N kernels the LLM gets to see. The UI keeps all five via the
+# tool_result SSE event; this cap is purely about LLM context size.
+_LLM_TOP_KERNELS_MAX = 3
+
+
+def _compact_for_llm(value: Any) -> Any:
+    """Strip verbose fields from a tool result before sending it to the LLM.
+
+    Why this exists: ``benchmark`` and ``profile_run`` return RunMetrics with
+    a ``top_kernels`` list whose entries carry full Tensile-generated rocBLAS
+    GEMM kernel names. Each name is ~200 chars; five per result is ~1KB of
+    pure noise the LLM doesn't extract anything actionable from. Worse, the
+    LLM tends to *regurgitate* them into downstream tool calls
+    (``compare_runs`` especially carries before+after RunMetrics, doubling the
+    bloat), where they collide with vLLM's ``max_tokens`` ceiling and get
+    truncated mid-JSON — surfacing as garbled raw text in the agent
+    reasoning panel.
+
+    This compactor only affects the LLM's view. The UI's ``tool_result`` SSE
+    event still carries the full ``result.result`` (so judges see the real
+    kernel names in the expandable card), and ``tool_results_log`` keeps the
+    full data so auto-synth Tier 1 can reconstruct an honest Report.
+
+    Operates on a shallow copy — does not mutate the original.
+    """
+    if not isinstance(value, dict):
+        return value
+    out = dict(value)
+    kernels = out.get("top_kernels")
+    if isinstance(kernels, list):
+        compact_kernels = []
+        for entry in kernels[:_LLM_TOP_KERNELS_MAX]:
+            if not isinstance(entry, dict):
+                compact_kernels.append(entry)
+                continue
+            name = entry.get("name", "")
+            if isinstance(name, str) and len(name) > _LLM_KERNEL_NAME_MAX:
+                name = name[:_LLM_KERNEL_NAME_MAX] + "…"
+            compact_kernels.append({**entry, "name": name})
+        out["top_kernels"] = compact_kernels
+    return out
+
+
 async def _drive(backend: Backend) -> AsyncIterator[SSEEvent]:
     """Pure orchestration loop. Backend handles per-API state; we yield events."""
     tool_results_log: list[dict[str, Any]] = []
@@ -226,8 +274,15 @@ async def _execute_tool_call(
         }
     )
 
+    # Compact `result.result` before handing it to the LLM — drops verbose
+    # rocBLAS Tensile kernel names that bloat context without helping
+    # reasoning. The UI's tool_result event (yielded above) and
+    # `tool_results_log` (appended above) both keep the full result, so
+    # auto-synth and the side-by-side metrics table are unaffected.
     content = (
-        _safe_json(result.result) if result.ok else (result.error or "tool failed")
+        _safe_json(_compact_for_llm(result.result))
+        if result.ok
+        else (result.error or "tool failed")
     )
     backend.add_tool_result(
         tool_call_id=tc.id,
