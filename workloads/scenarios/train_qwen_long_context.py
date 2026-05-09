@@ -29,7 +29,11 @@ from transformers import (
     TrainingArguments,
 )
 
-from workloads._runtime import emit_torch_profile, parse_runtime_args
+from workloads._runtime import (
+    emit_torch_profile,
+    parse_runtime_args,
+    trainer_tokenizer_kwargs,
+)
 
 _runtime = parse_runtime_args()
 
@@ -95,7 +99,7 @@ trainer = Trainer(
     model=model,
     args=training_args,
     train_dataset=dataset,
-    tokenizer=tokenizer,
+    **trainer_tokenizer_kwargs(Trainer, tokenizer),
 )
 
 if __name__ == "__main__":

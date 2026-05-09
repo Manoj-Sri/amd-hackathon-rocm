@@ -127,3 +127,29 @@ def emit_torch_profile(
         # Don't tank the run on a profile-emit failure; the agent will
         # just see "fake" metrics for this step instead of "live".
         print(f"[workloads._runtime] failed to write {path}: {exc}")
+
+
+def trainer_tokenizer_kwargs(trainer_cls, tokenizer) -> dict:
+    """Return the right kwarg for handing a tokenizer to ``Trainer``.
+
+    transformers ≥ 4.46 renamed ``tokenizer=`` to ``processing_class=`` (the
+    old name is still accepted with a DeprecationWarning, but a future
+    release drops it). Older versions only know ``tokenizer=``. We
+    introspect ``Trainer.__init__`` so the workloads run on either
+    generation without pinning a transformers version.
+
+    Use site:
+
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=dataset,
+            **trainer_tokenizer_kwargs(Trainer, tokenizer),
+            data_collator=_toy_collate,
+        )
+    """
+    import inspect
+
+    if "processing_class" in inspect.signature(trainer_cls.__init__).parameters:
+        return {"processing_class": tokenizer}
+    return {"tokenizer": tokenizer}

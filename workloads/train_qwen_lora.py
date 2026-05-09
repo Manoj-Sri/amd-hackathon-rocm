@@ -30,7 +30,11 @@ from transformers import (
     TrainingArguments,
 )
 
-from workloads._runtime import emit_torch_profile, parse_runtime_args
+from workloads._runtime import (
+    emit_torch_profile,
+    parse_runtime_args,
+    trainer_tokenizer_kwargs,
+)
 
 # Parse the goblin_runner.sh injected flags (--max_steps, --torch_profile_out).
 _runtime = parse_runtime_args()
@@ -146,7 +150,7 @@ trainer = Trainer(
     model=model,
     args=training_args,
     train_dataset=dataset,
-    tokenizer=tokenizer,
+    **trainer_tokenizer_kwargs(Trainer, tokenizer),
     data_collator=_toy_collate,
 )
 
