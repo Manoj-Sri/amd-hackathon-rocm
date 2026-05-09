@@ -524,3 +524,4 @@ satisfies the submission requirement.
 | `GOBLIN_BACKEND_URL` | `http://localhost:8000/audit` | UI's backend endpoint. |
 | `ROCM_IMAGE_TAG` | `unknown` | Container tag mixed into the benchmark cache key. |
 | `GOBLIN_GPU_ID` | `0` | Which `/dev/dri/renderD*` to bind in `goblin_runner.sh`. |
+| `GOBLIN_RUNNER_TIMEOUT_SECONDS` | `1800` | LiveRunner subprocess timeout. Bump if cold-cache model downloads or kernel JIT push past 30 min; LiveRunner falls back to FakeRunner once exceeded. |

@@ -222,6 +222,41 @@ def _archive_failure(out_dir: Path, proc: subprocess.CompletedProcess) -> Path:
     return dest
 
 
+def _default_runner_timeout_seconds() -> int:
+    """Resolve the LiveRunner subprocess timeout from env, with safe defaults.
+
+    Reads ``GOBLIN_RUNNER_TIMEOUT_SECONDS`` and validates it as a positive
+    int. Anything missing, empty, non-numeric, or non-positive falls back to
+    1800 seconds (30 minutes).
+
+    Why this helper exists: live MI300X audits sometimes overshoot the old
+    600s default — model download on a cold cache, ROCm kernel JIT on the
+    first step, or torch silently running on CPU after a botched pip
+    install. Operators need a knob to extend the budget without editing
+    code; this turns it into a single env var.
+    """
+    raw = os.environ.get("GOBLIN_RUNNER_TIMEOUT_SECONDS", "").strip()
+    if not raw:
+        return 1800
+    try:
+        val = int(raw)
+    except ValueError:
+        _LOG.warning(
+            "LiveRunner: GOBLIN_RUNNER_TIMEOUT_SECONDS=%r is not an int; "
+            "falling back to 1800s.",
+            raw,
+        )
+        return 1800
+    if val <= 0:
+        _LOG.warning(
+            "LiveRunner: GOBLIN_RUNNER_TIMEOUT_SECONDS=%d is not positive; "
+            "falling back to 1800s.",
+            val,
+        )
+        return 1800
+    return val
+
+
 class LiveRunner:
     """Real-MI300X path: shells out to goblin_runner.sh and parses artefacts.
 
@@ -236,17 +271,26 @@ class LiveRunner:
         self,
         runner_script: Path | str = _DEFAULT_RUNNER_SCRIPT,
         user_script: Path | str = _DEFAULT_USER_SCRIPT,
-        timeout_seconds: int = 600,
+        timeout_seconds: int | None = None,
         fake_fallback: FakeRunner | None = None,
     ) -> None:
-        # Default 600s (10 min). Profile runs (10 steps) finish in seconds
-        # on a healthy MI300X; benchmarks (50 steps) in a couple of minutes.
-        # 30 minutes was a leftover from a workload that wasn't honoring
-        # --max_steps and silently trained for hours. With max_steps wired
-        # correctly, 600s is generous.
+        # `timeout_seconds=None` (the default) means "consult
+        # GOBLIN_RUNNER_TIMEOUT_SECONDS, then fall back to 1800s (30 min)".
+        # Explicit ints from callers/tests still win.
+        #
+        # 30 min is generous on a healthy MI300X — a 50-step benchmark of
+        # Qwen2.5-7B LoRA at bs=1/seq=512 finishes in 2–5 min when torch is
+        # correctly using ROCm. The extra headroom absorbs cold model
+        # downloads, kernel JIT on first run, and slow CPU-fallback hiccups
+        # if torch ends up CPU-only. If your workload needs longer, bump
+        # the env var:
+        #     export GOBLIN_RUNNER_TIMEOUT_SECONDS=3600
         self.runner_script = Path(runner_script)
         self.user_script = Path(user_script)
-        self.timeout_seconds = timeout_seconds
+        self.timeout_seconds = (
+            timeout_seconds if timeout_seconds is not None
+            else _default_runner_timeout_seconds()
+        )
         self._fake = fake_fallback or FakeRunner()
 
     # ------------------------------------------------------------------
