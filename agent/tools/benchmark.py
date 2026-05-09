@@ -22,6 +22,7 @@ import hashlib
 import json
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -88,6 +89,18 @@ def _cache_key(config: dict, steps: int) -> str:
 
 def _cache_path(key: str) -> Path:
     return _CACHE_DIR / f"{key}.json"
+
+
+def _humanize_seconds(seconds: float) -> str:
+    if seconds < 0:
+        return "in the future?"
+    if seconds < 60:
+        return f"{seconds:.0f}s ago"
+    if seconds < 3600:
+        return f"{seconds / 60:.1f}m ago"
+    if seconds < 86400:
+        return f"{seconds / 3600:.1f}h ago"
+    return f"{seconds / 86400:.1f}d ago"
 
 
 def _read_cache(key: str) -> dict[str, Any] | None:
@@ -170,8 +183,18 @@ def _benchmark(
         if cached is not None:
             metrics_dict = cached.get("metrics", cached)
             metrics = RunMetrics.model_validate(metrics_dict)
+            cache_file = _cache_path(key)
+            try:
+                age = time.time() - cache_file.stat().st_mtime
+                age_str = _humanize_seconds(age)
+            except OSError:
+                age_str = "unknown age"
             metrics.warnings = [
-                "benchmark: cache hit (pass cache=False to bypass)",
+                (
+                    f"benchmark: cache hit (key={key[:12]}…, "
+                    f"file={cache_file}, age={age_str}). "
+                    "Pass cache=False or delete that file to force a fresh live run."
+                ),
                 *metrics.warnings,
             ]
             return ToolResult(ok=True, result=metrics.model_dump())

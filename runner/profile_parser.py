@@ -409,7 +409,7 @@ def _read_amd_smi(path: Path, warnings: list[str]) -> _SmiSummary:
     """Aggregate amd-smi polling output into HBM peak/avg + GPU util."""
     summary = _SmiSummary()
     if not path.exists():
-        warnings.append(f"profile_parser: amd-smi telemetry not found at {path}")
+        warnings.append(_amd_smi_missing_reason(path))
         return summary
 
     try:
@@ -476,6 +476,51 @@ def _read_amd_smi(path: Path, warnings: list[str]) -> _SmiSummary:
     except (OSError, csv.Error) as exc:
         warnings.append(f"profile_parser: failed to read amd-smi telemetry ({exc})")
         return summary
+
+
+def _amd_smi_missing_reason(csv_path: Path) -> str:
+    """Build a self-diagnostic warning when amd_smi.csv is absent.
+
+    goblin_runner.sh's start_amd_smi() drops one of two sidecar files when
+    telemetry is intentionally skipped — surface its contents so the user
+    doesn't have to dig into a vanished /tmp dir to figure out why HBM
+    util/rocm_version came back empty.
+    """
+    out_dir = csv_path.parent
+    skipped = out_dir / "amd_smi.skipped"
+    err = out_dir / "amd_smi.err"
+
+    base = f"profile_parser: amd-smi telemetry not found at {csv_path}"
+    detail: str | None = None
+    if skipped.exists():
+        try:
+            msg = skipped.read_text().strip()
+        except OSError:
+            msg = ""
+        detail = (
+            f"goblin_runner.sh deliberately skipped telemetry "
+            f"(amd_smi.skipped: {msg or 'no detail'}). "
+            "HBM/GPU-util will fall back to kernel-trace estimates."
+        )
+    elif err.exists():
+        try:
+            tail = err.read_text().strip().splitlines()[-3:]
+        except OSError:
+            tail = []
+        detail = (
+            "amd-smi sidecar wrote an error log "
+            f"(amd_smi.err tail: {tail!r}). "
+            "Check the amd-smi flag matrix in goblin_runner.sh:start_amd_smi()."
+        )
+    elif not out_dir.exists():
+        detail = (
+            "the runner's tempdir was already cleaned up — these metrics are "
+            "almost certainly being replayed from bench_cache/. Pass cache=False "
+            "(or delete the matching bench_cache/<hash>.json) to re-run live."
+        )
+    if detail:
+        return f"{base}. {detail}"
+    return base
 
 
 def _hbm_to_gb(raw: str | None) -> float | None:
