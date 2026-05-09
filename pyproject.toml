@@ -26,6 +26,21 @@ dev = [
   "pytest-asyncio>=0.23",
   "ruff>=0.4",
 ]
+# Workload-execution stack — only needed when goblin_runner.sh actually runs
+# workloads/train_qwen_lora.py on an MI300X. The official ROCm/PyTorch
+# containers (rocm/pytorch, rocm/vllm) ship torch+rocm preinstalled, so
+# this extra is for bare environments that need to hand-install the
+# training-script dependencies. `torch` is intentionally NOT pinned: the
+# ROCm wheel tag (e.g. `2.3.0+rocm6.1`) is environment-specific and
+# overspecifying it here would conflict with the container's preinstalled
+# version. `bitsandbytes` is deliberately omitted — the bnb scenario is
+# supposed to fail on ROCm; that's the bug it demonstrates.
+runtime = [
+  "torch",
+  "transformers>=4.40",
+  "datasets>=2.16",
+  "peft>=0.10",
+]
 
 [build-system]
 requires = ["setuptools>=68"]

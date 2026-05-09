@@ -62,6 +62,26 @@ plays a cached audit trajectory (`tests/fixtures/cached_audit.json`) so
 judges can see the canonical `142 → 318 tok/s (2.24×)` demo without our
 backend or any live LLM.
 
+### Workload-execution dependencies
+
+`agent` + `runner` + `ui` only need the deps installed by `pip install -e
+".[dev]"`. But `goblin_runner.sh` shells out and executes the user's
+training script (`workloads/train_qwen_lora.py` and the scenarios), which
+imports `torch`, `transformers`, `datasets`, and `peft` at module top —
+none of which are in the base install. If you intend to **execute** a
+workload (live MI300X path) on a bare environment, also install:
+
+```bash
+pip install -e ".[runtime]"
+```
+
+The official ROCm/PyTorch containers (`rocm/pytorch`, `rocm/vllm`) already
+ship these, so on the AMD Developer Cloud recipe below this is a no-op.
+On a laptop without `[runtime]`, the agent loop still runs end-to-end —
+`LiveRunner` short-circuits to `FakeRunner` before ever invoking the
+script, so no import failure surfaces. The only place this extra is
+required is a real MI300X execution path on a non-default container.
+
 ## Repo Layout
 
 ```
@@ -153,6 +173,19 @@ python -m pytest tests/ -q              # 86 tests pass without GPU; faster sani
 # Live run on MI300X:
 python -m agent workloads/train_qwen_lora.py
 # Streams SSE events: thought, tool_call, tool_result, ..., final_report
+```
+
+The `rocm/pytorch` container above already has `torch`, `transformers`,
+`datasets`, and `peft` preinstalled, so the live workload script imports
+cleanly. If you're running on a barer image (or hit
+`ModuleNotFoundError` from inside `goblin_runner.sh`'s subprocess on the
+first live run), add the workload-execution extra:
+
+```bash
+pip install -e ".[runtime]"
+# pulls torch (rocm wheel, if available), transformers, datasets, peft.
+# bitsandbytes is intentionally NOT included — the bnb scenario is
+# supposed to fail on ROCm.
 ```
 
 ### 5. Run the FastAPI server + UI
