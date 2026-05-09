@@ -109,17 +109,31 @@ def _bool_env(name: str) -> bool | None:
 # Map the agent's KB-vocabulary attention_impl names to the names
 # transformers' from_pretrained actually validates against. The KB uses
 # "flash_rocm" as a semantic tag — "the ROCm-validated flash attention" —
-# while transformers itself only knows the version-suffixed canonical names
-# ("flash_attention_2" / "flash_attention_3"); the underlying library
-# (FlashAttn, Optimum-AMD, etc.) figures out CUDA vs ROCm at load time.
+# while transformers itself only knows the canonical names: eager /
+# sdpa / flash_attention_2 / flash_attention_3 / flex_attention.
+#
+# Why "flash_rocm" → "sdpa" rather than "flash_attention_2": transformers'
+# flash_attention_2 path calls into the `flash-attn` library, which is
+# primarily NVIDIA-tuned. Its ROCm port is strict about runtime version
+# matching against the torch wheel — we've seen "Memory access fault by
+# GPU node-1" crashes mid-training under torch+rocm6.2 wheel + ROCm 7.x
+# system runtime. SDPA is PyTorch's built-in scaled-dot-product attention
+# (torch.nn.functional.scaled_dot_product_attention), no external library,
+# always available with modern PyTorch, and on MI300X it dispatches to
+# Composable Kernel-backed implementations that are tested against the
+# torch wheel itself — no version-mismatch surface. Slightly less
+# headroom than a perfectly-tuned flash-attn build but rock solid.
+#
 # Without this translation, applying a patch with attention_impl=flash_rocm
 # would fail at from_pretrained with:
 #   ValueError: Specified `attn_implementation="flash_rocm"` is not supported.
 _TRANSFORMERS_ATTN_NAME_MAP: dict[str, str] = {
-    "flash_rocm": "flash_attention_2",
-    "flash": "flash_attention_2",
+    "flash_rocm": "sdpa",
+    "flash": "sdpa",
     # eager / sdpa / flex_attention / flash_attention_2 / flash_attention_3
-    # pass through unchanged.
+    # pass through unchanged. If you have a known-good flash-attn build
+    # matching your torch wheel, the agent can still propose
+    # attention_impl="flash_attention_2" explicitly and it'll pass through.
 }
 
 
