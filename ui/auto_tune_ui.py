@@ -72,25 +72,34 @@ with st.sidebar:
     st.header("Run configuration")
 
     # ---- Backend mode (Local subprocess vs remote GPU server) ----
-    default_backend = os.environ.get("GOBLIN_AUTO_TUNE_URL", "")
+    # The remote URL comes from the GOBLIN_AUTO_TUNE_URL env var only —
+    # NOT exposed as a user input. On the deployed HF Space this is set
+    # via Settings → Variables and secrets and points at the operator's
+    # MI300X droplet. End-users shouldn't be able to redirect requests
+    # to arbitrary hosts.
+    backend_url = os.environ.get("GOBLIN_AUTO_TUNE_URL", "").strip()
     backend_mode = st.radio(
         "Backend",
         options=("Local subprocess", "Remote GPU server"),
-        index=1 if default_backend else 0,
+        index=1 if backend_url else 0,
         help=(
-            "Local: launches scripts/auto_tune.py here (this host needs an MI300X). "
-            "Remote: POSTs to /auto-tune on a FastAPI server you've stood up on "
-            "the GPU host. Use Remote when running the UI on HF Spaces."
+            "Local: launches scripts/auto_tune.py on this host (needs an MI300X). "
+            "Remote: POSTs to /auto-tune on the FastAPI server configured via "
+            "the GOBLIN_AUTO_TUNE_URL env var."
         ),
     )
-    backend_url = ""
     if backend_mode == "Remote GPU server":
-        backend_url = st.text_input(
-            "Backend URL",
-            value=default_backend or "http://localhost:8000",
-            help="Base URL of the FastAPI server (no trailing slash). "
-            "/auto-tune is appended automatically.",
-        )
+        if backend_url:
+            st.caption(
+                f"📡 Backend: `{backend_url}` "
+                "(set via `GOBLIN_AUTO_TUNE_URL`)"
+            )
+        else:
+            st.error(
+                "Remote mode requires the `GOBLIN_AUTO_TUNE_URL` "
+                "environment variable to be set on this host (e.g. via "
+                "the HF Space's Settings → Variables and secrets)."
+            )
 
     st.divider()
     workload_source = st.radio(
