@@ -69,14 +69,27 @@ backend or any live LLM.
 training script (`workloads/train_qwen_lora.py` and the scenarios), which
 imports `torch`, `transformers`, `datasets`, and `peft` at module top —
 none of which are in the base install. If you intend to **execute** a
-workload (live MI300X path) on a bare environment, also install:
+workload (live MI300X path) and your environment doesn't already have
+the HF stack, install it on top of the container's torch:
 
 ```bash
-pip install -e ".[runtime]"
+pip install -e ".[runtime]"   # transformers, datasets, peft (NOT torch)
 ```
 
-The official ROCm/PyTorch containers (`rocm/pytorch`, `rocm/vllm`) already
-ship these, so on the AMD Developer Cloud recipe below this is a no-op.
+> ⚠️ **Why `[runtime]` deliberately doesn't pin torch.** The
+> `rocm/pytorch` and `rocm/vllm` containers ship `torch+rocm`
+> preinstalled (e.g. `2.9.0.dev+rocm7.0.0.gitXXXX`). If you create a
+> fresh venv inside the container and run `pip install torch`, pip will
+> happily download the **CPU-only** wheel from PyPI and shadow the
+> container's ROCm build — at which point `torch.cuda.is_available()`
+> returns `False` and your training silently runs on the host CPU. The
+> tell is `torch.version.hip is None`. To avoid this:
+>
+> - Prefer running outside any venv (use the container's system python),
+>   or
+> - Create the venv with `python -m venv .venv --system-site-packages`
+>   so the container's ROCm torch stays visible inside it.
+
 On a laptop without `[runtime]`, the agent loop still runs end-to-end —
 `LiveRunner` short-circuits to `FakeRunner` before ever invoking the
 script, so no import failure surfaces. The only place this extra is
