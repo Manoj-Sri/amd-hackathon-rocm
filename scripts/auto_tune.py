@@ -469,6 +469,7 @@ that's already present here.
 
 Latest benchmark (this is the result of the most recent ACCEPTED state):
 - tokens_per_sec: {tps:.1f}
+- mfu_pct:        {mfu:.2f}   (% of MI300X dense bf16 peak; healthy LoRA ranges 30-50%)
 - gpu_util_pct:   {util:.1f}
 - hbm_peak_gb:    {hbm:.2f}
 - waste_budget (seconds/step):
@@ -769,6 +770,7 @@ async def _ask_llm_for_experiment(
         kb_summary=kb_summary,
         tunables=_tunables_summary(source),
         tps=metrics.get("tokens_per_sec", 0.0),
+        mfu=metrics.get("mfu_pct", 0.0),
         util=metrics.get("gpu_util_pct", 0.0),
         hbm=metrics.get("hbm_peak_gb", 0.0),
         waste_lines=_format_waste(waste),
@@ -908,6 +910,7 @@ already present here.
 
 Latest benchmark (this is the result of the most recent ACCEPTED state):
 - tokens_per_sec: {tps:.1f}
+- mfu_pct:        {mfu:.2f}   (% of MI300X dense bf16 peak; healthy LoRA ranges 30-50%)
 - gpu_util_pct:   {util:.1f}
 - hbm_peak_gb:    {hbm:.2f}
 - waste_budget (seconds/step):
@@ -949,6 +952,7 @@ async def _ask_llm_for_experiments(
         kb_summary=kb_summary,
         tunables=_tunables_summary(source),
         tps=metrics.get("tokens_per_sec", 0.0),
+        mfu=metrics.get("mfu_pct", 0.0),
         util=metrics.get("gpu_util_pct", 0.0),
         hbm=metrics.get("hbm_peak_gb", 0.0),
         waste_lines=_format_waste(waste),
@@ -1316,6 +1320,7 @@ def main() -> int:
 
     baseline_tps = baseline["tokens_per_sec"]
     print(f"  tokens/sec:    {baseline_tps:.1f}")
+    print(f"  mfu_pct:       {baseline.get('mfu_pct', 0.0):.2f}")
     print(f"  hbm_peak_gb:   {baseline['hbm_peak_gb']:.2f}")
     print(f"  gpu_util_pct:  {baseline['gpu_util_pct']:.1f}")
     print(
@@ -1485,6 +1490,7 @@ def main() -> int:
             tps = m["tokens_per_sec"]
             delta_vs_best = _delta_pct(tps, best_tps)
             print(f"    tokens/sec:  {tps:.1f}  (Δ {delta_vs_best:+.2f}% vs current best)")
+            print(f"    mfu_pct:     {m.get('mfu_pct', 0.0):.2f}")
             print(f"    hbm_peak_gb: {m['hbm_peak_gb']:.2f}")
             print(f"    gpu_util_pct:{m['gpu_util_pct']:.1f}")
             _print_waste(m, prefix="    waste:       ")
