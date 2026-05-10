@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Iterative auto-tuner for AMD MI300X / ROCm 7.0 workloads.
 
-Two modes, picked with `--mode`:
+Three modes, picked with `--mode`:
 
   hardcoded (default)
     Walks through a curated list of MI300X-specific tuning changes one
@@ -9,12 +9,19 @@ Two modes, picked with `--mode`:
     derived from the rules in kb/rocm_rules.yaml.
 
   llm
-    On each iteration, asks the same LLM backend the agent uses
-    (qwen-hf via HF_TOKEN, or qwen-vllm via GOBLIN_QWEN_VLLM_URL) for
-    the next single experiment to try, given the live waste_budget,
-    history of what's been tried, and the KB rules as context. The
-    LLM's response is parsed as JSON with the same shape as the
-    hardcoded Experiment dataclass.
+    On each iteration, asks the LLM backend (qwen-hf via HF_TOKEN, or
+    qwen-vllm via GOBLIN_QWEN_VLLM_URL) for ONE next experiment given
+    the live waste_budget, history, and KB rules. Greedy coordinate
+    descent — accept changes that beat the current best by the
+    improvement threshold, otherwise revert.
+
+  llm-explore
+    On each iteration, asks the LLM for K candidate experiments at
+    once (--candidates-per-iteration, default 3). Benchmarks all K,
+    picks the one with the highest tokens/sec, and accepts only if it
+    beats the current best. Higher GPU cost (~Kx benchmarks per
+    iteration) but better at finding interaction effects that greedy
+    one-at-a-time can miss.
 
 After each change, runs a real benchmark via goblin_runner.sh and keeps
 the change only if tokens/sec improved meaningfully (>1% by default —
@@ -26,9 +33,13 @@ Usage:
     # hardcoded mode (default):
     python scripts/auto_tune.py workloads/train_qwen_lora.py --steps 20
 
-    # LLM-driven mode:
+    # LLM-driven greedy mode:
     python scripts/auto_tune.py workloads/train_qwen_lora.py \\
-        --mode llm --steps 20 --max-iterations 10
+        --mode llm --steps 20
+
+    # LLM-driven multi-candidate exploration:
+    python scripts/auto_tune.py workloads/train_qwen_lora.py \\
+        --mode llm-explore --candidates-per-iteration 3 --steps 20
 
 Output:
   - A row-by-row log of each experiment attempted, accepted or rejected
@@ -611,7 +622,7 @@ def _format_waste(waste: dict) -> str:
     return "\n".join(f"    {k:18s} = {waste.get(k, 0.0):.4f}" for k in keys)
 
 
-def _build_llm_backend():
+def _build_llm_backend(system_prompt: str = _LLM_SYSTEM_PROMPT, max_tokens: int = 1024):
     """Construct the same backend the agent loop uses. Surfaces a clear
     message if neither HF_TOKEN nor a vLLM URL is configured."""
     has_hf = bool(os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACEHUB_API_TOKEN"))
@@ -628,7 +639,7 @@ def _build_llm_backend():
         )
     from agent.backends import make_backend
 
-    return make_backend(system_prompt=_LLM_SYSTEM_PROMPT, max_tokens=1024)
+    return make_backend(system_prompt=system_prompt, max_tokens=max_tokens)
 
 
 async def _ask_llm_for_experiment(
@@ -700,6 +711,297 @@ async def _ask_llm_for_experiment(
     )
 
 
+# ---------------------------------------------------------------------------
+# llm-explore mode: ask for K candidates per iteration
+# ---------------------------------------------------------------------------
+
+
+_LLM_EXPLORE_SYSTEM_PROMPT = """\
+You are an expert at tuning AMD MI300X (ROCm 7.0, CDNA3 arch, 192 GB
+HBM3) training workloads. The user is running a multi-candidate
+exploration: on every iteration you suggest K STRUCTURALLY-DIFFERENT
+candidate changes, the user benchmarks all of them, and the best one
+is accepted (if it beats the current best by the threshold).
+
+Your output MUST be a JSON ARRAY of K objects, no prose, no markdown
+fences, just the array:
+
+[
+  {"name": "...", "rationale": "...", "substitutions": [["regex", "repl"]], "env_vars": {"VAR": "value"}},
+  {"name": "...", "rationale": "...", "substitutions": [["regex", "repl"]], "env_vars": {"VAR": "value"}},
+  {"name": "...", "rationale": "...", "substitutions": [["regex", "repl"]], "env_vars": {"VAR": "value"}}
+]
+
+CRITICAL output rules:
+
+1. Each candidate must target a DIFFERENT waste bucket or parameter
+   category than the others. Diversity beats redundancy — don't propose
+   three batch-size bumps; propose one batch bump, one env var, one
+   precision/attention/dataloader change.
+
+2. env_vars keys are LITERAL shell environment variable names. NEVER
+   prefix them with "env_vars." or any other dotted path.
+   Wrong:  {"env_vars.MIOPEN_FIND_MODE": "3"}
+   Right:  {"MIOPEN_FIND_MODE": "3"}
+
+3. substitutions are (regex_pattern, replacement) pairs applied with
+   re.subn. Patterns must match at least one occurrence — if zero
+   matches, that candidate is skipped.
+
+4. NEVER propose a (substitutions, env_vars) combination that already
+   appears in history with outcome rejected/crashed. Diversify within
+   the array AND across the run.
+
+5. If you genuinely cannot find K productive candidates, output fewer
+   (e.g. 2 if K=3). The user will benchmark whatever you provide. If
+   you have zero productive candidates, output:
+     [{"name": "STOP", "rationale": "<why>", "substitutions": [], "env_vars": {}}]
+
+CONCRETE OUTPUT EXAMPLES (for K=3):
+
+[
+  {"name": "bf16_over_fp16",
+   "rationale": "Largest recoverable bucket is precision_path; CDNA3 prefers bf16.",
+   "substitutions": [["fp16=True", "bf16=True"], ["torch_dtype=torch\\\\.float16", "torch_dtype=torch.bfloat16"]],
+   "env_vars": {}},
+  {"name": "batch_size_16",
+   "rationale": "HBM peak well under 192 GB; bigger batch saturates the GPU.",
+   "substitutions": [["per_device_train_batch_size=\\\\d+", "per_device_train_batch_size=16"]],
+   "env_vars": {}},
+  {"name": "prefer_hipblaslt",
+   "rationale": "hipBLASLt outperforms rocBLAS on Qwen GEMM shapes.",
+   "substitutions": [],
+   "env_vars": {"TORCH_BLAS_PREFER_HIPBLASLT": "1"}}
+]
+"""
+
+
+_LLM_EXPLORE_USER_TEMPLATE = """\
+Hardware facts (use these — do not contradict):
+- AMD MI300X, CDNA3 architecture, 192 GB HBM3
+- bf16 throughput on CDNA3 ≈ same as fp16, > fp32 (matrix engine is fp16/bf16/fp8 native)
+- fp32 is the SLOWEST option on this arch — never suggest it as an improvement
+
+Known incompatibilities for THIS workload (peft + LoRA on transformers Trainer):
+{incompatibilities}
+
+KB rules (one-liner per rule, for grounding):
+{kb_summary}
+
+Current accepted workload state — the literal values in the script
+after every change accepted so far. Each candidate you propose should
+mutate one of these (or set an env var). DO NOT propose a value that's
+already present here.
+{tunables}
+
+Latest benchmark (this is the result of the most recent ACCEPTED state):
+- tokens_per_sec: {tps:.1f}
+- gpu_util_pct:   {util:.1f}
+- hbm_peak_gb:    {hbm:.2f}
+- waste_budget (seconds/step):
+{waste_lines}
+
+Sorted recoverable waste (largest first — go after these):
+{recoverable_sorted}
+
+Previously rejected (full fingerprint — DO NOT repropose any of these):
+{rejected_fingerprints}
+
+History of changes already tried this run (newest first; outcomes are
+"accepted" / "rejected" / "crashed" / "skipped"):
+{history_lines}
+
+Suggest {num_candidates} STRUCTURALLY-DIFFERENT candidate changes.
+Each must target a different waste bucket or parameter category. JSON
+array only.
+"""
+
+
+async def _ask_llm_for_experiments(
+    backend,
+    *,
+    kb_summary: str,
+    source: str,
+    metrics: dict,
+    history: list[dict],
+    num_candidates: int,
+) -> list[Experiment]:
+    """One LLM turn → up to `num_candidates` Experiments.
+
+    Returns an empty list on parse failure or STOP signal.
+    """
+    waste = metrics.get("waste_budget") or {}
+    prompt = _LLM_EXPLORE_USER_TEMPLATE.format(
+        num_candidates=num_candidates,
+        incompatibilities="\n".join(f"- {line}" for line in _KNOWN_INCOMPATIBILITIES),
+        kb_summary=kb_summary,
+        tunables=_tunables_summary(source),
+        tps=metrics.get("tokens_per_sec", 0.0),
+        util=metrics.get("gpu_util_pct", 0.0),
+        hbm=metrics.get("hbm_peak_gb", 0.0),
+        waste_lines=_format_waste(waste),
+        recoverable_sorted=_recoverable_sorted(waste),
+        rejected_fingerprints=_format_rejected_fingerprints(history),
+        history_lines=_format_history(history),
+    )
+    backend.add_user_message(prompt)
+    turn = await backend.next_turn(tool_schemas=[])
+    raw = " ".join(turn.text_blocks).strip()
+
+    arr = _extract_json_array(raw)
+    if not arr:
+        print(f"  LLM response was not parseable JSON array. Raw: {raw[:300]!r}")
+        return []
+
+    experiments: list[Experiment] = []
+    for obj in arr:
+        if not isinstance(obj, dict):
+            continue
+        name = (obj.get("name") or "").strip()
+        if not name:
+            continue
+        if name.upper() == "STOP":
+            print(f"  LLM signaled STOP: {obj.get('rationale', '(no rationale)')}")
+            return []
+        subs_raw = obj.get("substitutions") or []
+        envs_raw = obj.get("env_vars") or {}
+        if not subs_raw and not envs_raw:
+            continue
+        subs = []
+        for entry in subs_raw:
+            if isinstance(entry, list) and len(entry) == 2:
+                subs.append((str(entry[0]), str(entry[1])))
+            elif isinstance(entry, dict) and "pattern" in entry and "replacement" in entry:
+                subs.append((str(entry["pattern"]), str(entry["replacement"])))
+        cleaned_envs = {}
+        for k, v in envs_raw.items():
+            key = str(k)
+            if "." in key:
+                key = key.rsplit(".", 1)[-1]
+            cleaned_envs[key] = str(v)
+        experiments.append(
+            Experiment(
+                name=name,
+                description=obj.get("description") or name,
+                rationale=str(obj.get("rationale") or ""),
+                substitutions=subs,
+                env_vars=cleaned_envs,
+            )
+        )
+    return experiments
+
+
+def _extract_json_array(text: str) -> list | None:
+    """Pull the first JSON array out of an LLM response, tolerating
+    markdown fences and leading prose. Returns None if nothing parseable."""
+    if not text:
+        return None
+    fence_match = re.search(r"```(?:json)?\s*(\[.*?\])\s*```", text, re.DOTALL)
+    if fence_match:
+        try:
+            obj = json.loads(fence_match.group(1))
+            if isinstance(obj, list):
+                return obj
+        except json.JSONDecodeError:
+            pass
+    depth = 0
+    start = -1
+    for i, ch in enumerate(text):
+        if ch == "[":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0 and start >= 0:
+                blob = text[start : i + 1]
+                try:
+                    obj = json.loads(blob)
+                    if isinstance(obj, list):
+                        return obj
+                except json.JSONDecodeError:
+                    start = -1
+                    continue
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Dedup + history utilities (used by all LLM modes)
+# ---------------------------------------------------------------------------
+
+
+def _experiment_fingerprint(exp: Experiment) -> tuple:
+    """Hashable identity for an experiment — substitutions + env_vars,
+    NOT name (the LLM tends to give the same change different names)."""
+    subs = tuple(sorted(tuple(s) for s in exp.substitutions))
+    envs = tuple(sorted(exp.env_vars.items()))
+    return (subs, envs)
+
+
+def _is_duplicate_of_history(exp: Experiment, history: list[dict]) -> dict | None:
+    """If `exp` matches a prior history entry by fingerprint, return that
+    entry. Otherwise None."""
+    fp = _experiment_fingerprint(exp)
+    for h in history:
+        h_subs = tuple(
+            sorted(
+                (str(s[0]), str(s[1]))
+                for s in (h.get("substitutions") or [])
+                if isinstance(s, (list, tuple)) and len(s) == 2
+            )
+        )
+        h_envs = tuple(sorted((h.get("env_vars") or {}).items()))
+        if fp == (h_subs, h_envs):
+            return h
+    return None
+
+
+def _format_rejected_fingerprints(history: list[dict]) -> str:
+    """Compact list of every (substitutions, env_vars) the LLM has already
+    tried with outcome rejected/crashed/skipped — so it can't propose them
+    again under a different name."""
+    seen: set[tuple] = set()
+    lines: list[str] = []
+    for h in history:
+        outcome = h.get("outcome", "")
+        if outcome not in ("rejected", "crashed", "skipped"):
+            continue
+        subs = tuple(
+            sorted(
+                (str(s[0]), str(s[1]))
+                for s in (h.get("substitutions") or [])
+                if isinstance(s, (list, tuple)) and len(s) == 2
+            )
+        )
+        envs = tuple(sorted((h.get("env_vars") or {}).items()))
+        fp = (subs, envs)
+        if fp in seen:
+            continue
+        seen.add(fp)
+        lines.append(f"  - {outcome:9s} subs={list(subs)} env={dict(envs)}")
+    if not lines:
+        return "  (none yet)"
+    return "\n".join(lines)
+
+
+def _print_waste(metrics: dict, prefix: str = "  waste:       ") -> None:
+    """Print a one-line summary of waste_budget — useful is highlighted
+    first, then non-zero recoverable buckets sorted by size."""
+    wb = metrics.get("waste_budget") or {}
+    if not wb:
+        return
+    parts = [f"useful_gpu={wb.get('useful_gpu', 0.0):.3f}"]
+    others = [(k, v) for k, v in wb.items() if k != "useful_gpu" and isinstance(v, (int, float)) and v > 0]
+    others.sort(key=lambda kv: kv[1], reverse=True)
+    parts.extend(f"{k}={v:.3f}" for k, v in others)
+    print(prefix + ", ".join(parts))
+
+
+# ---------------------------------------------------------------------------
+# JSON object extractor (used by single-experiment llm mode)
+# ---------------------------------------------------------------------------
+
+
 def _extract_json_object(text: str) -> dict | None:
     """Pull the first JSON object out of an LLM response, tolerating
     markdown fences / leading prose."""
@@ -744,13 +1046,20 @@ def main() -> int:
     p.add_argument("workload", type=Path, help="Path to workload script")
     p.add_argument(
         "--mode",
-        choices=("hardcoded", "llm"),
+        choices=("hardcoded", "llm", "llm-explore"),
         default="hardcoded",
         help=(
             "hardcoded (default): walk through the priority-ordered EXPERIMENTS list. "
-            "llm: ask the agent's configured LLM backend (qwen-hf or qwen-vllm) for "
-            "the next experiment based on the live waste_budget + history."
+            "llm: ask the LLM for ONE next experiment per iteration (greedy). "
+            "llm-explore: ask for K candidates per iteration, benchmark all, keep "
+            "the best (slower but better at finding interaction effects)."
         ),
+    )
+    p.add_argument(
+        "--candidates-per-iteration",
+        type=int,
+        default=3,
+        help="Only used when --mode llm-explore. Default 3.",
     )
     p.add_argument("--steps", type=int, default=20, help="Steps per benchmark")
     p.add_argument(
@@ -790,7 +1099,12 @@ def main() -> int:
     )
     args = p.parse_args()
     if args.max_iterations <= 0:
-        args.max_iterations = len(EXPERIMENTS) if args.mode == "hardcoded" else 10
+        if args.mode == "hardcoded":
+            args.max_iterations = len(EXPERIMENTS)
+        elif args.mode == "llm-explore":
+            args.max_iterations = 5  # K candidates per iter so 5 iters = 5K benchmarks
+        else:
+            args.max_iterations = 10
 
     workload = args.workload.resolve()
     if not workload.exists():
@@ -811,13 +1125,22 @@ def main() -> int:
     print(f"Accept threshold:    {args.improvement_threshold:.1f}%\n")
 
     # LLM mode setup happens before the baseline so we fail fast on missing
-    # credentials rather than after burning a baseline benchmark.
+    # credentials rather than after burning a baseline benchmark. Each LLM
+    # mode gets its own system prompt — the explore mode needs a much
+    # larger token budget to emit K JSON objects.
     llm_backend = None
     kb_summary = ""
     if args.mode == "llm":
-        llm_backend = _build_llm_backend()
+        llm_backend = _build_llm_backend(_LLM_SYSTEM_PROMPT, max_tokens=1024)
         kb_summary = _kb_summary(REPO_ROOT / "kb" / "rocm_rules.yaml")
-        print("LLM backend ready. KB summary loaded.\n")
+        print("LLM backend ready (single-candidate). KB summary loaded.\n")
+    elif args.mode == "llm-explore":
+        llm_backend = _build_llm_backend(_LLM_EXPLORE_SYSTEM_PROMPT, max_tokens=2048)
+        kb_summary = _kb_summary(REPO_ROOT / "kb" / "rocm_rules.yaml")
+        print(
+            f"LLM backend ready (multi-candidate, K={args.candidates_per_iteration}). "
+            "KB summary loaded.\n"
+        )
 
     baseline_source = workload.read_text()
     baseline_path = workspace / "00_baseline.py"
@@ -849,15 +1172,16 @@ def main() -> int:
     history: list[dict] = []  # for LLM context
     consecutive_no_improvement = 0
     total_crashes = 0
+    file_counter = 0  # monotonically increases across all candidates
 
     for i in range(args.max_iterations):
-        # ---- Get next experiment (mode-dependent) ----
+        # ---- Get candidates list (1 for hardcoded/llm, K for llm-explore) ----
         if args.mode == "hardcoded":
             if i >= len(EXPERIMENTS):
                 print("\nReached end of EXPERIMENTS list.")
                 break
-            exp = EXPERIMENTS[i]
-        else:  # llm
+            candidates = [EXPERIMENTS[i]]
+        elif args.mode == "llm":
             print(f"\n[asking LLM for next experiment, iteration {i + 1}...]")
             try:
                 exp = asyncio.run(
@@ -875,112 +1199,208 @@ def main() -> int:
             if exp is None:
                 print("LLM produced no experiment — stopping.")
                 break
+            candidates = [exp]
+        else:  # llm-explore
+            K = args.candidates_per_iteration
+            print(f"\n[asking LLM for {K} candidates, iteration {i + 1}...]")
+            try:
+                candidates = asyncio.run(
+                    _ask_llm_for_experiments(
+                        llm_backend,
+                        kb_summary=kb_summary,
+                        source=best_source,
+                        metrics=last_metrics,
+                        history=history,
+                        num_candidates=K,
+                    )
+                )
+            except Exception as exc:
+                print(f"  LLM call failed: {type(exc).__name__}: {exc}")
+                candidates = []
+            if not candidates:
+                print("LLM produced no candidates — stopping.")
+                break
+            print(f"  LLM proposed {len(candidates)} candidate(s): "
+                  + ", ".join(c.name for c in candidates))
 
         print()
         print("=" * 60)
-        print(f"Iteration {i + 1}: {exp.name}")
+        n_label = f" ({len(candidates)} candidates)" if len(candidates) > 1 else ""
+        print(f"Iteration {i + 1}{n_label}")
         print("=" * 60)
-        print(f"  description: {exp.description}")
-        print(f"  rationale:   {exp.rationale}")
 
-        # ---- Build candidate source ----
-        if exp.substitutions:
-            try:
-                candidate_source = apply_substitutions(best_source, exp.substitutions)
-            except re.error as exc:
-                print(f"  SKIPPED — invalid regex from LLM: {exc}")
-                rejected.append((exp.name, f"bad regex: {exc}"))
-                history.append({
-                    "name": exp.name, "outcome": "rejected",
-                    "delta_pct": None,
-                    "substitutions": exp.substitutions, "env_vars": exp.env_vars,
-                })
-                consecutive_no_improvement += 1
-                if consecutive_no_improvement >= args.early_stop_after:
-                    print(f"\nNo improvement for {args.early_stop_after} consecutive iterations — early stopping.")
-                    break
-                continue
-            if candidate_source is None:
-                print("  SKIPPED — substitution patterns didn't match (already applied or N/A)")
-                rejected.append((exp.name, "patterns didn't match"))
+        # ---- Evaluate each candidate against the CURRENT best ----
+        # Crucial for llm-explore: every candidate is benchmarked against
+        # the same best_source / best_env baseline, so the comparison is
+        # apples-to-apples. State updates only happen after the iteration's
+        # winner is chosen.
+        eval_results: list[dict] = []  # candidates that produced metrics
+        seen_this_iter: set[tuple] = set()  # within-batch dedup
+        crashed_this_iter = False
+        max_crashes_hit = False
+
+        for j, exp in enumerate(candidates):
+            cand_label = f"  Candidate {j + 1}/{len(candidates)}" if len(candidates) > 1 else "  Candidate"
+            print(f"\n{cand_label}: {exp.name}")
+            print(f"    description: {exp.description}")
+            print(f"    rationale:   {exp.rationale}")
+
+            # Dedup: against prior iterations' history
+            dup = _is_duplicate_of_history(exp, history)
+            if dup is not None:
+                print(f"    SKIPPED — already tried as '{dup.get('name', '?')}' "
+                      f"(outcome '{dup.get('outcome', '?')}')")
                 history.append({
                     "name": exp.name, "outcome": "skipped",
                     "delta_pct": None,
                     "substitutions": exp.substitutions, "env_vars": exp.env_vars,
                 })
-                consecutive_no_improvement += 1
-                if consecutive_no_improvement >= args.early_stop_after:
-                    print(f"\nNo improvement for {args.early_stop_after} consecutive iterations — early stopping.")
+                continue
+
+            # Dedup: within the current batch (llm-explore can collide)
+            fp = _experiment_fingerprint(exp)
+            if fp in seen_this_iter:
+                print("    SKIPPED — duplicate of an earlier candidate in this iteration")
+                history.append({
+                    "name": exp.name, "outcome": "skipped",
+                    "delta_pct": None,
+                    "substitutions": exp.substitutions, "env_vars": exp.env_vars,
+                })
+                continue
+            seen_this_iter.add(fp)
+
+            # Apply substitutions
+            if exp.substitutions:
+                try:
+                    candidate_source = apply_substitutions(best_source, exp.substitutions)
+                except re.error as exc:
+                    print(f"    SKIPPED — invalid regex from LLM: {exc}")
+                    rejected.append((exp.name, f"bad regex: {exc}"))
+                    history.append({
+                        "name": exp.name, "outcome": "rejected",
+                        "delta_pct": None,
+                        "substitutions": exp.substitutions, "env_vars": exp.env_vars,
+                    })
+                    continue
+                if candidate_source is None:
+                    print("    SKIPPED — substitution patterns didn't match")
+                    rejected.append((exp.name, "patterns didn't match"))
+                    history.append({
+                        "name": exp.name, "outcome": "skipped",
+                        "delta_pct": None,
+                        "substitutions": exp.substitutions, "env_vars": exp.env_vars,
+                    })
+                    continue
+            else:
+                candidate_source = best_source
+
+            file_counter += 1
+            safe_name = re.sub(r"[^A-Za-z0-9_]+", "_", exp.name)[:40] or "exp"
+            candidate_path = workspace / f"{file_counter:03d}_iter{i + 1:02d}_{safe_name}.py"
+            candidate_path.write_text(candidate_source)
+
+            candidate_env = {**best_env, **exp.env_vars}
+            if exp.env_vars:
+                print(f"    env vars:    {exp.env_vars}")
+
+            m = benchmark(candidate_path, args.steps, candidate_env)
+            if m is None:
+                rejected.append((exp.name, "benchmark crashed"))
+                history.append({
+                    "name": exp.name, "outcome": "crashed",
+                    "delta_pct": None,
+                    "substitutions": exp.substitutions, "env_vars": exp.env_vars,
+                })
+                total_crashes += 1
+                crashed_this_iter = True
+                print(
+                    f"    CRASHED — counted toward max-crashes "
+                    f"({total_crashes}/{args.max_crashes})"
+                )
+                if total_crashes >= args.max_crashes:
+                    max_crashes_hit = True
                     break
                 continue
-        else:
-            candidate_source = best_source
 
-        # Slugify name for the filename
-        safe_name = re.sub(r"[^A-Za-z0-9_]+", "_", exp.name)[:40] or "exp"
-        candidate_path = workspace / f"{i + 1:02d}_{safe_name}.py"
-        candidate_path.write_text(candidate_source)
-        candidate_env = {**best_env, **exp.env_vars}
-        if exp.env_vars:
-            print(f"  env vars:    {exp.env_vars}")
-
-        m = benchmark(candidate_path, args.steps, candidate_env)
-        if m is None:
-            # Crash: the change was structurally bad (incompatible flag,
-            # OOM, etc.). DON'T count this against consecutive_no_improvement
-            # — the LLM should get a fresh chance to try something
-            # categorically different. Cap total crashes separately.
-            rejected.append((exp.name, "benchmark crashed"))
-            history.append({
-                "name": exp.name, "outcome": "crashed",
-                "delta_pct": None,
-                "substitutions": exp.substitutions, "env_vars": exp.env_vars,
-            })
-            total_crashes += 1
-            print(
-                f"  CRASHED — counted toward max-crashes "
-                f"({total_crashes}/{args.max_crashes}), not toward early-stop"
-            )
-            if total_crashes >= args.max_crashes:
-                print(
-                    f"\nReached max-crashes ({args.max_crashes}) — stopping to "
-                    "avoid burning more GPU on structurally bad changes."
-                )
-                break
-            continue
-        else:
             tps = m["tokens_per_sec"]
-            delta = _delta_pct(tps, best_tps)
-            print(f"  tokens/sec:  {tps:.1f}  (Δ {delta:+.2f}% vs current best)")
-            print(f"  hbm_peak_gb: {m['hbm_peak_gb']:.2f}")
-            print(f"  gpu_util_pct:{m['gpu_util_pct']:.1f}")
+            delta_vs_best = _delta_pct(tps, best_tps)
+            print(f"    tokens/sec:  {tps:.1f}  (Δ {delta_vs_best:+.2f}% vs current best)")
+            print(f"    hbm_peak_gb: {m['hbm_peak_gb']:.2f}")
+            print(f"    gpu_util_pct:{m['gpu_util_pct']:.1f}")
+            _print_waste(m, prefix="    waste:       ")
 
-            if delta >= args.improvement_threshold:
-                print(f"  ACCEPTED — {exp.name} is the new baseline")
-                best_source = candidate_source
-                best_tps = tps
-                best_env = candidate_env
-                last_metrics = m
-                accepted.append((exp.name, tps, delta))
+            eval_results.append({
+                "exp": exp,
+                "candidate_source": candidate_source,
+                "candidate_env": candidate_env,
+                "metrics": m,
+                "delta_vs_best": delta_vs_best,
+            })
+
+        if max_crashes_hit:
+            print(
+                f"\nReached max-crashes ({args.max_crashes}) — stopping to "
+                "avoid burning more GPU on structurally bad changes."
+            )
+            break
+
+        # ---- Pick the iteration's winner from eval_results ----
+        if not eval_results:
+            # Every candidate was skipped or crashed
+            if crashed_this_iter:
+                print("\n  All candidates crashed or were skipped this iteration.")
+            else:
+                print("\n  All candidates were skipped this iteration.")
+            consecutive_no_improvement += 1
+        else:
+            winner = max(eval_results, key=lambda r: r["metrics"]["tokens_per_sec"])
+            winner_delta = winner["delta_vs_best"]
+
+            if winner_delta >= args.improvement_threshold:
+                print(
+                    f"\n  ACCEPTED — '{winner['exp'].name}' wins "
+                    f"(Δ {winner_delta:+.2f}% vs current best)"
+                )
+                best_source = winner["candidate_source"]
+                best_tps = winner["metrics"]["tokens_per_sec"]
+                best_env = winner["candidate_env"]
+                last_metrics = winner["metrics"]
+                accepted.append((winner["exp"].name, best_tps, winner_delta))
                 history.append({
-                    "name": exp.name, "outcome": "accepted",
-                    "delta_pct": delta,
-                    "substitutions": exp.substitutions, "env_vars": exp.env_vars,
+                    "name": winner["exp"].name, "outcome": "accepted",
+                    "delta_pct": winner_delta,
+                    "substitutions": winner["exp"].substitutions,
+                    "env_vars": winner["exp"].env_vars,
                 })
+                # Other candidates of this iteration get marked rejected
+                for r in eval_results:
+                    if r is winner:
+                        continue
+                    rejected.append((r["exp"].name, f"{r['delta_vs_best']:+.2f}%"))
+                    history.append({
+                        "name": r["exp"].name, "outcome": "rejected",
+                        "delta_pct": r["delta_vs_best"],
+                        "substitutions": r["exp"].substitutions,
+                        "env_vars": r["exp"].env_vars,
+                    })
                 consecutive_no_improvement = 0
             else:
-                print("  REJECTED — improvement below threshold")
-                rejected.append((exp.name, f"{delta:+.2f}%"))
-                history.append({
-                    "name": exp.name, "outcome": "rejected",
-                    "delta_pct": delta,
-                    "substitutions": exp.substitutions, "env_vars": exp.env_vars,
-                })
-                # In LLM mode the latest metrics are still useful context
-                # even on a rejected experiment — let the LLM see what
-                # happened.
-                if args.mode == "llm":
-                    last_metrics = m
+                print(
+                    f"\n  ALL REJECTED — best candidate '{winner['exp'].name}' "
+                    f"only Δ {winner_delta:+.2f}% (threshold {args.improvement_threshold:.1f}%)"
+                )
+                for r in eval_results:
+                    rejected.append((r["exp"].name, f"{r['delta_vs_best']:+.2f}%"))
+                    history.append({
+                        "name": r["exp"].name, "outcome": "rejected",
+                        "delta_pct": r["delta_vs_best"],
+                        "substitutions": r["exp"].substitutions,
+                        "env_vars": r["exp"].env_vars,
+                    })
+                # Update last_metrics with the winner anyway so the LLM sees
+                # the latest waste_budget on the next turn.
+                if args.mode in ("llm", "llm-explore"):
+                    last_metrics = winner["metrics"]
                 consecutive_no_improvement += 1
 
         if consecutive_no_improvement >= args.early_stop_after:
