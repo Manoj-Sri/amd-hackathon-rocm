@@ -413,80 +413,156 @@ def _read_amd_smi(path: Path, warnings: list[str]) -> _SmiSummary:
         return summary
 
     try:
-        with path.open(newline="") as f:
-            reader = csv.DictReader(f)
-            if reader.fieldnames is None:
-                warnings.append(f"profile_parser: empty amd-smi telemetry at {path}")
-                return summary
-            hbm_col = _pick_column(
-                reader.fieldnames,
-                [
-                    # ROCm 7.x amd-smi --vram-usage emits "VRAM_USED" or
-                    # "vram_used_mb" depending on minor version
-                    "VRAM_USED_MB",
-                    "vram_used_mb",
-                    "VRAM_USED",
-                    "VRAM_USED_GB",
-                    "vram_used",
-                    "VRAM Used",
-                    # Older rocm 6.x naming
-                    "MEM_USED",
-                    "mem_used",
-                ],
-            )
-            util_col = _pick_column(
-                reader.fieldnames,
-                [
-                    # ROCm 7.x: --gfx flag → "gfx_util" / "GFX_UTIL"
-                    "GFX_UTIL",
-                    "gfx_util",
-                    "GFX_UTILIZATION",
-                    "gfx_utilization",
-                    # rocm 6.x and older
-                    "GFX_ACTIVITY",
-                    "gfx_activity",
-                    "GPU_USE",
-                    "GFX %",
-                    "Util",
-                ],
-            )
-            rocm_col = _pick_column(reader.fieldnames, ["ROCM_VERSION", "rocm_version"])
-
-            hbm_samples: list[float] = []
-            util_samples: list[float] = []
-            for row in reader:
-                if hbm_col:
-                    hbm_gb = _hbm_to_gb(row.get(hbm_col))
-                    if hbm_gb is not None:
-                        hbm_samples.append(hbm_gb)
-                if util_col:
-                    util = _coerce_float(row.get(util_col))
-                    if util is not None:
-                        util_samples.append(min(100.0, util))
-                if rocm_col and summary.rocm_version is None:
-                    val = (row.get(rocm_col) or "").strip()
-                    if val:
-                        summary.rocm_version = val
-            if hbm_samples:
-                summary.hbm_peak_gb = max(hbm_samples)
-                summary.hbm_avg_gb = sum(hbm_samples) / len(hbm_samples)
-            if util_samples:
-                summary.gpu_util_pct = sum(util_samples) / len(util_samples)
-            return summary
-    except (OSError, csv.Error) as exc:
+        raw = path.read_text()
+    except OSError as exc:
         warnings.append(f"profile_parser: failed to read amd-smi telemetry ({exc})")
         return summary
 
+    csv_text = _strip_amd_smi_preamble(raw)
+    if csv_text is None:
+        warnings.append(f"profile_parser: no parseable header in amd-smi telemetry at {path}")
+        return summary
 
-def _hbm_to_gb(raw: str | None) -> float | None:
-    """amd-smi sometimes reports VRAM in MB, sometimes in GB. Heuristic: if
-    the number is > 1024 we assume MB and divide."""
+    try:
+        import io as _io
+
+        reader = csv.DictReader(_io.StringIO(csv_text))
+        if reader.fieldnames is None:
+            warnings.append(f"profile_parser: empty amd-smi telemetry at {path}")
+            return summary
+        hbm_col = _pick_column(
+            reader.fieldnames,
+            [
+                # `amd-smi metric --mem-usage --csv` (ROCm 7.x) emits
+                # "used_vram" in MB. Older `amd-smi monitor --vram-usage`
+                # emits "VRAM_USED" / "vram_used_mb" depending on minor
+                # version.
+                "used_vram",
+                "USED_VRAM",
+                "VRAM_USED_MB",
+                "vram_used_mb",
+                "VRAM_USED",
+                "VRAM_USED_GB",
+                "vram_used",
+                "VRAM Used",
+                # Older rocm 6.x naming
+                "MEM_USED",
+                "mem_used",
+            ],
+        )
+        util_col = _pick_column(
+            reader.fieldnames,
+            [
+                # `amd-smi metric --usage --csv` (ROCm 7.x) emits a single
+                # consolidated "usage" column. Some builds report N/A here
+                # — _coerce_float drops those silently and we fall back to
+                # the kernel-trace gpu_util estimate downstream.
+                "usage",
+                "USAGE",
+                # `amd-smi monitor --gfx` (ROCm 7.x) → "gfx_util"
+                "GFX_UTIL",
+                "gfx_util",
+                "GFX_UTILIZATION",
+                "gfx_utilization",
+                # rocm 6.x and older
+                "GFX_ACTIVITY",
+                "gfx_activity",
+                "GPU_USE",
+                "GFX %",
+                "Util",
+            ],
+        )
+        rocm_col = _pick_column(reader.fieldnames, ["ROCM_VERSION", "rocm_version"])
+
+        hbm_samples: list[float] = []
+        util_samples: list[float] = []
+        for row in reader:
+            if hbm_col:
+                hbm_gb = _hbm_to_gb(row.get(hbm_col), hbm_col)
+                if hbm_gb is not None:
+                    hbm_samples.append(hbm_gb)
+            if util_col:
+                util = _coerce_float(row.get(util_col))
+                if util is not None:
+                    util_samples.append(min(100.0, util))
+            if rocm_col and summary.rocm_version is None:
+                val = (row.get(rocm_col) or "").strip()
+                if val:
+                    summary.rocm_version = val
+        if hbm_samples:
+            summary.hbm_peak_gb = max(hbm_samples)
+            summary.hbm_avg_gb = sum(hbm_samples) / len(hbm_samples)
+        if util_samples:
+            summary.gpu_util_pct = sum(util_samples) / len(util_samples)
+        return summary
+    except csv.Error as exc:
+        warnings.append(f"profile_parser: failed to parse amd-smi telemetry ({exc})")
+        return summary
+
+
+def _strip_amd_smi_preamble(raw: str) -> str | None:
+    """Drop everything before the first real CSV header and dedupe repeated
+    header lines — both noise produced by `amd-smi <subcmd> --watch`.
+
+    --watch prints a "'CTRL' + 'C' to stop watching output:" banner once at
+    the top, then re-emits the CSV header on every iteration. csv.DictReader
+    naively reads the banner as fieldnames and treats every subsequent
+    header as a misshapen data row. Pre-strip both before handing it off.
+
+    Returns a CSV string ready for DictReader, or None if no header line
+    is recognisable.
+    """
+    lines = raw.splitlines()
+    header_idx: int | None = None
+    for i, line in enumerate(lines):
+        if "," not in line:
+            continue
+        lower = line.lower()
+        # Recognised tokens come from the columns amd-smi metric / monitor
+        # actually emit. Match conservatively — banners or other noise can
+        # contain commas too.
+        if any(tok in lower for tok in ("vram", "gfx_", "timestamp,", "gpu_use", "gpu,")):
+            header_idx = i
+            break
+    if header_idx is None:
+        return None
+
+    header = lines[header_idx]
+    data = [
+        line
+        for line in lines[header_idx + 1 :]
+        if line.strip() and line != header
+    ]
+    return header + "\n" + "\n".join(data) + ("\n" if data else "")
+
+
+def _hbm_to_gb(raw: str | None, column_name: str | None = None) -> float | None:
+    """amd-smi sometimes reports VRAM in MB, sometimes in GB.
+
+    First check the column name — `*vram*` / `*_mb` columns are MB-typed
+    in every amd-smi build we've seen; `*_gb` is GB. Without a column-name
+    hint, fall back to a value heuristic. The old "v > 1024 ⇒ MB" heuristic
+    misclassified small idle samples (e.g. 285 MB at GPU idle) as GB and
+    inflated the peak across the run, which then forced memory_headroom to
+    zero downstream.
+    """
     if not raw:
         return None
     try:
         v = float(str(raw).strip().replace("MB", "").replace("GB", "").replace(",", ""))
     except ValueError:
         return None
+    if column_name:
+        lower = column_name.lower()
+        if "_mb" in lower or lower.endswith("mb"):
+            return v / 1024.0
+        if "_gb" in lower or lower.endswith("gb"):
+            return v
+        if "vram" in lower or "mem" in lower:
+            # amd-smi metric / monitor default to MB for the bare
+            # `used_vram` / `mem_used` columns on every ROCm 6.x+ build.
+            return v / 1024.0
+    # No column hint — fall back to value heuristic.
     if v > 1024.0:
         return v / 1024.0
     return v
