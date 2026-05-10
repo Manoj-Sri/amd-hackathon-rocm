@@ -152,6 +152,11 @@ trainer = Trainer(
 
 
 if __name__ == "__main__":
+    # Total parameter count drives MFU. For a peft-wrapped model this
+    # includes both the frozen base (which still does forward) and the
+    # tiny LoRA adapters. The forward+backward FLOPs estimate uses the
+    # full count (the standard 6N rule lives inside emit_torch_profile).
+    _model_params = sum(p.numel() for p in model.parameters())
     _t0 = time.time()
     trainer.train()
     _elapsed = time.time() - _t0
@@ -166,4 +171,5 @@ if __name__ == "__main__":
         per_device_batch=training_args.per_device_train_batch_size,
         grad_accum=training_args.gradient_accumulation_steps,
         seq_len_cap=512,
+        model_params=_model_params,
     )

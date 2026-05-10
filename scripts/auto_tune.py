@@ -148,6 +148,18 @@ EXPERIMENTS: list[Experiment] = [
         ],
     ),
     Experiment(
+        name="batch_size_32",
+        description="Push per_device_train_batch_size to 32",
+        rationale=(
+            "MI300X has 192 GB HBM3 — batch 16 typically peaks ~130 GB. "
+            "If 16 fit, 32 likely fits too and reduces step overhead per "
+            "token. Reverts cleanly via OOM-as-crash if not."
+        ),
+        substitutions=[
+            (r"per_device_train_batch_size=\d+", "per_device_train_batch_size=32"),
+        ],
+    ),
+    Experiment(
         name="sdpa_attention",
         description="Switch attention from eager to SDPA",
         rationale=(

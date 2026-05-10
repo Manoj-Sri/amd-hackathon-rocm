@@ -86,6 +86,22 @@ def parse_runtime_args() -> RuntimeArgs:
     )
 
 
+# MI300X (CDNA3) peak throughput, dense, bf16/fp16 — both arrive at the
+# same number on this arch since the matrix engine is the same. Source:
+# AMD Instinct MI300X datasheet. With sparsity it's ~2.6 PFLOPS, but
+# transformers training rarely hits the sparse path so we use dense as
+# the realistic peak.
+_MI300X_PEAK_FLOPS_DENSE_BF16 = 1.307e15
+
+# FLOPs per token for forward + backward. The standard 6N approximation
+# (forward 2N + backward 4N for full fine-tuning) slightly overestimates
+# LoRA — pure LoRA backward only computes weight gradients for the small
+# adapter matrices, not the frozen base — so true LoRA flops/token is
+# closer to 4N. We use 6N as the conventional choice and accept a ~30%
+# pessimistic MFU for LoRA. Still useful as a relative metric run-to-run.
+_FLOPS_PER_TOKEN_FACTOR = 6
+
+
 def emit_torch_profile(
     path: str,
     *,
@@ -94,13 +110,16 @@ def emit_torch_profile(
     per_device_batch: int,
     grad_accum: int = 1,
     seq_len_cap: int = 512,
+    model_params: int = 0,
 ) -> None:
     """Write the smallest torch_profile-shape JSON profile_parser will read.
 
     profile_parser._read_torch_profile looks for these top-level fields under
     ``metadata``: tokens_per_sec, mfu_pct, step_time_seconds, pytorch_version.
-    We supply the first three and pytorch_version (mfu_pct is optional and
-    estimated downstream).
+
+    `model_params` is optional — pass `sum(p.numel() for p in
+    model.parameters())` from the workload to get a populated `mfu_pct`.
+    Without it, mfu_pct stays unset (profile_parser will default to 0).
 
     No-ops when ``path`` is empty (script run outside goblin_runner.sh) or
     when ``n_steps`` is 0 (training crashed before finishing a step).
@@ -113,14 +132,18 @@ def emit_torch_profile(
         global_batch = max(1, per_device_batch) * max(1, grad_accum)
         approx_tokens = n_steps * global_batch * seq_len_cap
         tokens_per_sec = approx_tokens / elapsed if elapsed > 0 else 0.0
-        payload = {
-            "metadata": {
-                "tokens_per_sec": round(tokens_per_sec, 2),
-                "step_time_seconds": round(elapsed / n_steps, 4),
-                "pytorch_version": torch.__version__,
-                "n_steps": n_steps,
-            }
+        metadata = {
+            "tokens_per_sec": round(tokens_per_sec, 2),
+            "step_time_seconds": round(elapsed / n_steps, 4),
+            "pytorch_version": torch.__version__,
+            "n_steps": n_steps,
         }
+        if model_params > 0 and tokens_per_sec > 0:
+            flops_per_token = _FLOPS_PER_TOKEN_FACTOR * model_params
+            mfu_pct = (flops_per_token * tokens_per_sec) / _MI300X_PEAK_FLOPS_DENSE_BF16 * 100
+            metadata["mfu_pct"] = round(mfu_pct, 2)
+            metadata["model_params"] = model_params
+        payload = {"metadata": metadata}
         with open(path, "w") as f:
             json.dump(payload, f)
     except Exception as exc:  # pragma: no cover — diagnostic only
