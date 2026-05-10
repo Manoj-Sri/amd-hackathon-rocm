@@ -44,17 +44,28 @@ start_amd_smi() {
             > "$OUT_DIR/amd_smi.err"
         return 1
     fi
-    # `amd-smi monitor` flag surface drifted across rocm versions. Verified
-    # combos in increasing order of legacy-ness:
-    #   ROCm 7.x  : `--watch <s> -p -u -m -v --csv` (renamed flags + must
-    #               specify at least one metric flag, otherwise the CLI
-    #               trips an internal `AttributeError: 'violation'`)
-    #   ROCm 6.x  : `--watch <s> --csv` worked alone in some builds
-    #   pre-6.0   : `--interval <s>` instead of `--watch`
-    #   very old  : just `amd-smi monitor` (or even `amd-smi`) implicit
-    # Try newest-first; first one that survives 0.5s is kept.
+    # amd-smi telemetry surface drifted hard across rocm versions. We try
+    # subcommands in this order, newest-first; first one that survives 0.5s
+    # is kept:
+    #
+    #   1. `amd-smi metric --watch <s> --mem-usage --usage --csv` (ROCm 7.x).
+    #      Different code path from `monitor`, so it dodges the known
+    #      `AttributeError: 'Namespace' object has no attribute 'violation'`
+    #      crash that some ROCm 7.x point releases ship inside the `monitor`
+    #      subcommand. Produces VRAM_USED_MB / GFX_ACTIVITY / MEM_ACTIVITY
+    #      columns that profile_parser._pick_column already recognises.
+    #
+    #   2. `amd-smi monitor --watch <s> ...` (ROCm 6.x and the 7.x builds
+    #      where `monitor` actually works). Kept as a fallback for older
+    #      installs that may not have the `metric --watch` form.
+    #
+    #   3. `amd-smi monitor --interval <s>` (pre-6.0) and finally bare
+    #      `amd-smi monitor` (very old / implicit-all).
     local variants=(
-        # ROCm 7.x-flavored: explicit metric flags + watch + csv
+        # ROCm 7.x: prefer the metric subcommand — bypasses the monitor bug.
+        "amd-smi metric --watch 1 --mem-usage --usage --csv"
+        "amd-smi metric -w 1 -m -u --csv"
+        # ROCm 7.x monitor (works on builds without the violation-attribute bug)
         "amd-smi monitor --watch 1 --power-usage --gfx --mem --vram-usage --csv"
         "amd-smi monitor -w 1 -p -u -m -v --csv"
         # ROCm 6.x intermediate forms
