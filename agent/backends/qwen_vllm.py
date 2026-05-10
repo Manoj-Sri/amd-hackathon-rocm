@@ -85,9 +85,9 @@ class QwenVLLMBackend(Backend):
             from openai import AsyncOpenAI
         except ImportError as exc:
             raise RuntimeError(
-                "QwenVLLMBackend requires the 'openai' package. "
-                "Install with `pip install openai>=1.30` (or `pip install -e \".[dev]\"` "
-                "for the full dev extras)."
+                "QwenVLLMBackend requires the 'openai' package, which is a "
+                "base dependency of this project. Run `pip install -e .` "
+                "(or `pip install openai>=1.30` to install only that one)."
             ) from exc
         return AsyncOpenAI(base_url=self._base_url, api_key=self._api_key)
 
