@@ -187,6 +187,14 @@ def benchmark(
         env["USER_SCRIPT"] = str(workload_path)
         env["OUT_DIR"] = str(out_dir)
         env["STEPS"] = str(steps)
+        # Candidate workload lives in /tmp, so its self-bootstrap line
+        # `sys.path.insert(0, dirname(dirname(__file__)))` resolves to /tmp
+        # — which has no `workloads/` package. Inject the real repo root via
+        # PYTHONPATH so `from workloads._runtime import ...` succeeds.
+        existing_pp = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = (
+            str(REPO_ROOT) + (os.pathsep + existing_pp if existing_pp else "")
+        )
         env.update(env_overrides)
 
         try:
