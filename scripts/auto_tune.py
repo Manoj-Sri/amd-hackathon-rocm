@@ -71,6 +71,44 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 GOBLIN_RUNNER = REPO_ROOT / "runner" / "goblin_runner.sh"
 sys.path.insert(0, str(REPO_ROOT))
 
+# Default workload template — used when the user passes --model instead
+# of an explicit workload path. We just substitute MODEL_ID and reuse all
+# the other defaults (fp16, batch=4, eager attention, LoRA r=16, …).
+_DEFAULT_WORKLOAD_TEMPLATE = REPO_ROOT / "workloads" / "train_qwen_lora.py"
+
+
+def _generate_workload_from_model(model_id: str, dest: Path) -> Path:
+    """Build a baseline workload by substituting MODEL_ID into the demo
+    template (`workloads/train_qwen_lora.py`). Writes to `dest`, returns
+    the path.
+
+    Caveats:
+    - Uses the demo's LoRA target_modules (`q_proj`, `v_proj`) which work
+      for the major decoder-only LLM families (Qwen, Llama, Mistral,
+      Gemma). MoE / GPT-2-style architectures will need a custom workload.
+    - The template overwrites HF_TOKEN with a redactable fake. Public
+      models load fine; gated models (Llama, etc.) need the user to edit
+      the generated workload or use a custom one.
+    """
+    if not _DEFAULT_WORKLOAD_TEMPLATE.exists():
+        raise SystemExit(
+            f"--model needs the template at {_DEFAULT_WORKLOAD_TEMPLATE}, but it's missing"
+        )
+    template_src = _DEFAULT_WORKLOAD_TEMPLATE.read_text()
+    new_src, n = re.subn(
+        r'MODEL_ID = "[^"]*"',
+        f'MODEL_ID = "{model_id}"',
+        template_src,
+    )
+    if n == 0:
+        raise SystemExit(
+            f"Couldn't find `MODEL_ID = \"...\"` in {_DEFAULT_WORKLOAD_TEMPLATE} "
+            "to substitute. Has the template format changed?"
+        )
+    dest.write_text(new_src)
+    return dest
+
+
 # POSIX env var name: leading letter or underscore, then alnum/underscore.
 # subprocess.run() raises ValueError if any key in the env dict violates
 # this. We validate up-front rather than letting the subprocess crash.
@@ -464,6 +502,16 @@ _KNOWN_INCOMPATIBILITIES = [
     " unless you have specific evidence it works on this version.",
     "flash_attention_2 may not be installed (try `attn_implementation=\"sdpa\"`"
     " before `\"flash_attention_2\"`).",
+    "persistent_workers=True requires num_workers > 0. PyTorch raises"
+    " `ValueError: persistent_workers option needs num_workers > 0` if you"
+    " enable it while num_workers=0. If the current workload has"
+    " dataloader_num_workers=0, do NOT propose persistent_workers=True"
+    " alone — pair it with `dataloader_num_workers=4` (or higher) in the"
+    " SAME experiment via two substitutions, or wait until a previous"
+    " experiment has bumped num_workers above 0.",
+    "dataloader_prefetch_factor only works when num_workers > 0 (same"
+    " constraint as persistent_workers). Same rule: bump num_workers in"
+    " the same experiment, or skip.",
 ]
 
 
@@ -1105,7 +1153,28 @@ def main() -> int:
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    p.add_argument("workload", type=Path, help="Path to workload script")
+    p.add_argument(
+        "workload",
+        type=Path,
+        nargs="?",
+        default=None,
+        help=(
+            "Path to a workload script (omit if using --model). When given, "
+            "the script is used as-is for the baseline benchmark."
+        ),
+    )
+    p.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help=(
+            "HuggingFace model id (e.g. Qwen/Qwen2.5-7B-Instruct, "
+            "meta-llama/Llama-3.2-3B). Generates a baseline workload from "
+            "workloads/train_qwen_lora.py with this MODEL_ID substituted in. "
+            "Use this OR a workload path, not both. For gated models, "
+            "ensure HF_TOKEN is set in your shell."
+        ),
+    )
     p.add_argument(
         "--mode",
         choices=("hardcoded", "llm", "llm-explore"),
@@ -1156,8 +1225,12 @@ def main() -> int:
     p.add_argument(
         "--improvement-threshold",
         type=float,
-        default=1.0,
-        help="Min %% improvement over current best to accept (default 1.0)",
+        default=0.0,
+        help=(
+            "Min %% improvement over current best to accept. Default 0.0 "
+            "(any positive delta wins). Bump to 1.0 if your benchmarks are "
+            "noisy and you want to ignore sub-1%% deltas."
+        ),
     )
     args = p.parse_args()
     if args.max_iterations <= 0:
@@ -1168,18 +1241,43 @@ def main() -> int:
         else:
             args.max_iterations = 10
 
-    workload = args.workload.resolve()
-    if not workload.exists():
-        sys.stderr.write(f"workload not found: {workload}\n")
+    # Validate that exactly one workload source was provided
+    if args.workload is None and args.model is None:
+        sys.stderr.write(
+            "Pass either a workload path or --model MODEL_ID. "
+            "Examples:\n"
+            "  python scripts/auto_tune.py workloads/train_qwen_lora.py\n"
+            "  python scripts/auto_tune.py --model Qwen/Qwen2.5-7B-Instruct\n"
+        )
+        return 1
+    if args.workload is not None and args.model is not None:
+        sys.stderr.write(
+            "Pass EITHER a workload path OR --model, not both.\n"
+        )
         return 1
     if not GOBLIN_RUNNER.exists():
         sys.stderr.write(f"goblin_runner.sh not found at {GOBLIN_RUNNER}\n")
         return 1
 
     workspace = Path(tempfile.mkdtemp(prefix="auto_tune_workloads_"))
+
+    if args.workload is not None:
+        workload = args.workload.resolve()
+        if not workload.exists():
+            sys.stderr.write(f"workload not found: {workload}\n")
+            return 1
+        workload_label = str(workload)
+    else:
+        # Generate baseline workload from --model
+        generated = workspace / "_generated_baseline.py"
+        workload = _generate_workload_from_model(args.model, generated)
+        workload_label = f"(generated from --model {args.model})\n                     "
+        workload_label += f"   {workload}\n                     "
+        workload_label += f"   template: {_DEFAULT_WORKLOAD_TEMPLATE}"
+
     print(f"Auto-tune workspace: {workspace}")
     print(f"Mode:                {args.mode}")
-    print(f"Workload:            {workload}")
+    print(f"Workload:            {workload_label}")
     print(f"Steps per benchmark: {args.steps}")
     print(f"Max iterations:      {args.max_iterations}")
     print(f"Early stop after:    {args.early_stop_after} non-improvements")
