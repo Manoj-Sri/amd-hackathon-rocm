@@ -71,6 +71,39 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 GOBLIN_RUNNER = REPO_ROOT / "runner" / "goblin_runner.sh"
 sys.path.insert(0, str(REPO_ROOT))
 
+# POSIX env var name: leading letter or underscore, then alnum/underscore.
+# subprocess.run() raises ValueError if any key in the env dict violates
+# this. We validate up-front rather than letting the subprocess crash.
+_VALID_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _sanitize_env_vars(envs: dict, context: str = "") -> dict[str, str]:
+    """Clean an env_vars dict from the LLM:
+      1. Strip dotted prefixes (`env_vars.X` → `X`) the LLM mimics from the
+         KB transform notation.
+      2. Drop any key that still isn't a valid POSIX env var name. Warns
+         instead of crashing — the LLM occasionally embeds shell syntax
+         (e.g. `'NUMACTL_INTERLEAVE=1'` as a key) which would make
+         subprocess.run raise ValueError.
+    """
+    cleaned: dict[str, str] = {}
+    for k, v in envs.items():
+        key = str(k)
+        if "." in key:
+            stripped = key.rsplit(".", 1)[-1]
+            tag = f" [{context}]" if context else ""
+            print(f"  [warn]{tag} dotted env key {key!r}; using {stripped!r}")
+            key = stripped
+        if not _VALID_ENV_NAME.match(key):
+            tag = f" [{context}]" if context else ""
+            print(
+                f"  [warn]{tag} dropping invalid env var name {key!r} "
+                "(must match [A-Za-z_][A-Za-z0-9_]*)"
+            )
+            continue
+        cleaned[key] = str(v)
+    return cleaned
+
 
 @dataclass
 class Experiment:
@@ -234,6 +267,18 @@ def benchmark(
         except subprocess.TimeoutExpired:
             print(f"  TIMEOUT after {timeout}s")
             return None
+        except ValueError as exc:
+            # subprocess.run validates env var names and raises ValueError
+            # for malformed keys (e.g. names containing '=' or spaces). The
+            # LLM has occasionally emitted those; we sanitize earlier but
+            # this is the last-resort backstop so a single bad candidate
+            # doesn't crash the whole tuning run.
+            print(f"  REJECTED — illegal env var name(s): {exc}")
+            print(f"  env keys offered: {list(env_overrides.keys())}")
+            return None
+        except OSError as exc:
+            print(f"  REJECTED — could not spawn goblin_runner.sh: {exc}")
+            return None
 
         if proc.returncode != 0:
             print(f"  goblin_runner.sh failed (exit {proc.returncode})")
@@ -282,13 +327,20 @@ prose, no markdown fences, just the object):
 
 CRITICAL output rules — read carefully:
 
-1. env_vars keys are LITERAL shell environment variable names. NEVER
-   prefix them with "env_vars." or any other dotted path. The KB rules
-   shown to you use dotted paths like `env_vars.MIOPEN_FIND_MODE`
-   because they describe a config dict — you must STRIP that prefix and
-   use just `MIOPEN_FIND_MODE` as the env var key.
+1. env_vars keys are LITERAL POSIX shell environment variable names.
+   They MUST match the regex [A-Za-z_][A-Za-z0-9_]* — letters, digits,
+   underscores only, starting with a letter or underscore.
+   - NEVER prefix them with "env_vars." or any other dotted path.
+   - NEVER include "=" or shell syntax in the key — env var names are
+     identifiers, NOT assignments and NOT commands.
+   - If you want to invoke a command-line tool like `numactl` or
+     `taskset`, that CANNOT be expressed as an env_var. Don't try.
+     Either propose a `substitutions` change to the script, or skip.
    Wrong:  {"env_vars.MIOPEN_FIND_MODE": "3"}
+   Wrong:  {"NUMACTL_INTERLEAVE=1": "numactl --interleave=all"}
+   Wrong:  {"export FOO": "bar"}
    Right:  {"MIOPEN_FIND_MODE": "3"}
+   Right:  {"TORCH_BLAS_PREFER_HIPBLASLT": "1"}
 
 2. substitutions are (regex_pattern, replacement) pairs applied with
    re.subn against the current workload source. Patterns must match at
@@ -690,17 +742,13 @@ async def _ask_llm_for_experiment(
         elif isinstance(entry, dict) and "pattern" in entry and "replacement" in entry:
             subs.append((str(entry["pattern"]), str(entry["replacement"])))
 
-    # Defensive: strip dotted-path prefixes from env var keys (e.g. the LLM
-    # emits `env_vars.MIOPEN_FIND_MODE` because it's mimicking the KB
-    # transform shape). The actual env var name is always the last segment.
-    cleaned_envs: dict[str, str] = {}
-    for k, v in envs.items():
-        key = str(k)
-        if "." in key:
-            stripped = key.rsplit(".", 1)[-1]
-            print(f"  [warn] LLM emitted dotted env key {key!r}; using {stripped!r} instead")
-            key = stripped
-        cleaned_envs[key] = str(v)
+    cleaned_envs = _sanitize_env_vars(envs, context=name)
+    if not subs and not cleaned_envs:
+        # Everything got dropped during sanitization (bad env names + no
+        # valid substitutions). Treat as a no-op rather than benchmarking
+        # an unchanged workload.
+        print(f"  LLM experiment {name!r} had nothing valid after sanitization; skipping")
+        return None
 
     return Experiment(
         name=name,
@@ -739,9 +787,13 @@ CRITICAL output rules:
    three batch-size bumps; propose one batch bump, one env var, one
    precision/attention/dataloader change.
 
-2. env_vars keys are LITERAL shell environment variable names. NEVER
-   prefix them with "env_vars." or any other dotted path.
+2. env_vars keys are LITERAL POSIX shell environment variable names —
+   they MUST match the regex [A-Za-z_][A-Za-z0-9_]*. NEVER prefix them
+   with "env_vars." or any other dotted path. NEVER include "=" or
+   shell syntax in the key. If you want to invoke a CLI tool like
+   `numactl`, that's NOT an env var — skip the candidate entirely.
    Wrong:  {"env_vars.MIOPEN_FIND_MODE": "3"}
+   Wrong:  {"NUMACTL_INTERLEAVE=1": "numactl --interleave=all"}
    Right:  {"MIOPEN_FIND_MODE": "3"}
 
 3. substitutions are (regex_pattern, replacement) pairs applied with
@@ -873,12 +925,10 @@ async def _ask_llm_for_experiments(
                 subs.append((str(entry[0]), str(entry[1])))
             elif isinstance(entry, dict) and "pattern" in entry and "replacement" in entry:
                 subs.append((str(entry["pattern"]), str(entry["replacement"])))
-        cleaned_envs = {}
-        for k, v in envs_raw.items():
-            key = str(k)
-            if "." in key:
-                key = key.rsplit(".", 1)[-1]
-            cleaned_envs[key] = str(v)
+        cleaned_envs = _sanitize_env_vars(envs_raw, context=name)
+        if not subs and not cleaned_envs:
+            print(f"  candidate {name!r} had nothing valid after sanitization; dropping")
+            continue
         experiments.append(
             Experiment(
                 name=name,
