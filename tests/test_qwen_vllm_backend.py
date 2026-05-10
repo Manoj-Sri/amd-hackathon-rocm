@@ -235,8 +235,25 @@ async def test_is_error_prefix_added_to_failed_tool_results() -> None:
 
 
 def test_make_backend_picks_vllm_when_env_var_set(monkeypatch) -> None:
+    import sys
+    from types import ModuleType
+
     monkeypatch.setenv("GOBLIN_AGENT_BACKEND", "qwen-vllm")
     monkeypatch.setenv("GOBLIN_QWEN_VLLM_URL", "http://test:8000/v1")
+
+    # The backend's __init__ lazy-imports openai. Stub it so the test works
+    # regardless of whether openai is installed in this dev env (it's a
+    # base dep, not a dev dep, so a partial install of just [dev] won't
+    # have it). monkeypatch reverts sys.modules at teardown.
+    fake_openai = ModuleType("openai")
+
+    class _FakeAsyncOpenAI:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+    fake_openai.AsyncOpenAI = _FakeAsyncOpenAI  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+
     assert active_backend_name() == "qwen-vllm"
     backend = make_backend(system_prompt="x")
     assert isinstance(backend, QwenVLLMBackend)
