@@ -337,14 +337,24 @@ Prefer hipBLASLt (kernel_shape bucket, env-only):
 
 
 _LLM_USER_TEMPLATE = """\
+Hardware facts (use these — do not contradict):
+- AMD MI300X, CDNA3 architecture, 192 GB HBM3
+- bf16 throughput on CDNA3 ≈ same as fp16, > fp32 (matrix engine is fp16/bf16/fp8 native)
+- fp32 is the SLOWEST option on this arch — never suggest it as an improvement
+
+Known incompatibilities for THIS workload (peft + LoRA on transformers Trainer):
+{incompatibilities}
+
 KB rules (one-liner per rule, for grounding):
 {kb_summary}
 
-Tunable parameters detected in the current workload — current literal
-values, and the regex pattern you'd use to change each:
+Current accepted workload state — these are the literal values in the
+script after every change accepted so far. The next change you propose
+should mutate one of these (or set an env var). DO NOT propose a value
+that's already present here.
 {tunables}
 
-Latest benchmark:
+Latest benchmark (this is the result of the most recent ACCEPTED state):
 - tokens_per_sec: {tps:.1f}
 - gpu_util_pct:   {util:.1f}
 - hbm_peak_gb:    {hbm:.2f}
@@ -354,11 +364,32 @@ Latest benchmark:
 Sorted recoverable waste (largest first — go after these):
 {recoverable_sorted}
 
-History of changes already tried this run (newest first):
+History of changes already tried this run (newest first; outcomes are
+"accepted" / "rejected" / "crashed" / "skipped"):
 {history_lines}
+
+If the latest entry is "crashed", the change you propose next must be
+STRUCTURALLY different (different parameter, not just a different value
+of the same one).
 
 Suggest ONE next change targeting the largest recoverable bucket. JSON only.
 """
+
+
+# Workload-specific incompatibilities the LLM otherwise wastes iterations on.
+# Keep this list short and concrete — it goes into every prompt.
+_KNOWN_INCOMPATIBILITIES = [
+    "gradient_checkpointing=True requires `model.enable_input_require_grads()`"
+    " before peft wrapping for LoRA models. Setting it via a single substitution"
+    " WILL CRASH the workload. Don't propose it.",
+    "bitsandbytes-based optimizers (`adamw_8bit`, `paged_adamw_8bit`) and"
+    " `load_in_8bit=True` are NOT supported on ROCm 7.x. Don't propose them.",
+    "torch_compile=True with peft/LoRA on ROCm 7.x triggers compile-time"
+    " errors with the current PyTorch nightly (2.9.x). Don't propose it"
+    " unless you have specific evidence it works on this version.",
+    "flash_attention_2 may not be installed (try `attn_implementation=\"sdpa\"`"
+    " before `\"flash_attention_2\"`).",
+]
 
 
 def _kb_summary(rules_yaml_path: Path, max_chars: int = 6000) -> str:
@@ -611,6 +642,7 @@ async def _ask_llm_for_experiment(
     """One LLM turn → one Experiment (or None for STOP / parse failure)."""
     waste = metrics.get("waste_budget") or {}
     prompt = _LLM_USER_TEMPLATE.format(
+        incompatibilities="\n".join(f"- {line}" for line in _KNOWN_INCOMPATIBILITIES),
         kb_summary=kb_summary,
         tunables=_tunables_summary(source),
         tps=metrics.get("tokens_per_sec", 0.0),
@@ -734,7 +766,21 @@ def main() -> int:
         "--early-stop-after",
         type=int,
         default=3,
-        help="Stop after N consecutive non-improvements",
+        help=(
+            "Stop after N consecutive non-improvements. Crashes do NOT count "
+            "toward this — crashes mean the change was structurally bad, not "
+            "that we've exhausted ideas."
+        ),
+    )
+    p.add_argument(
+        "--max-crashes",
+        type=int,
+        default=4,
+        help=(
+            "Stop after N total subprocess crashes (separate from "
+            "--early-stop-after). Default 4 leaves room for the LLM to try "
+            "structurally different changes after a bad one."
+        ),
     )
     p.add_argument(
         "--improvement-threshold",
@@ -761,6 +807,7 @@ def main() -> int:
     print(f"Steps per benchmark: {args.steps}")
     print(f"Max iterations:      {args.max_iterations}")
     print(f"Early stop after:    {args.early_stop_after} non-improvements")
+    print(f"Max crashes:         {args.max_crashes} total")
     print(f"Accept threshold:    {args.improvement_threshold:.1f}%\n")
 
     # LLM mode setup happens before the baseline so we fail fast on missing
@@ -801,6 +848,7 @@ def main() -> int:
     rejected: list[tuple[str, str]] = []  # (name, reason)
     history: list[dict] = []  # for LLM context
     consecutive_no_improvement = 0
+    total_crashes = 0
 
     for i in range(args.max_iterations):
         # ---- Get next experiment (mode-dependent) ----
@@ -878,13 +926,28 @@ def main() -> int:
 
         m = benchmark(candidate_path, args.steps, candidate_env)
         if m is None:
-            rejected.append((exp.name, "benchmark failed"))
+            # Crash: the change was structurally bad (incompatible flag,
+            # OOM, etc.). DON'T count this against consecutive_no_improvement
+            # — the LLM should get a fresh chance to try something
+            # categorically different. Cap total crashes separately.
+            rejected.append((exp.name, "benchmark crashed"))
             history.append({
-                "name": exp.name, "outcome": "failed",
+                "name": exp.name, "outcome": "crashed",
                 "delta_pct": None,
                 "substitutions": exp.substitutions, "env_vars": exp.env_vars,
             })
-            consecutive_no_improvement += 1
+            total_crashes += 1
+            print(
+                f"  CRASHED — counted toward max-crashes "
+                f"({total_crashes}/{args.max_crashes}), not toward early-stop"
+            )
+            if total_crashes >= args.max_crashes:
+                print(
+                    f"\nReached max-crashes ({args.max_crashes}) — stopping to "
+                    "avoid burning more GPU on structurally bad changes."
+                )
+                break
+            continue
         else:
             tps = m["tokens_per_sec"]
             delta = _delta_pct(tps, best_tps)
