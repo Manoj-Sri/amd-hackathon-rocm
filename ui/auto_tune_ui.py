@@ -31,6 +31,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 import altair as alt
 import pandas as pd
+import requests
 import streamlit as st
 
 REPO_ROOT = _REPO_ROOT
@@ -70,6 +71,28 @@ st.caption(
 with st.sidebar:
     st.header("Run configuration")
 
+    # ---- Backend mode (Local subprocess vs remote GPU server) ----
+    default_backend = os.environ.get("GOBLIN_AUTO_TUNE_URL", "")
+    backend_mode = st.radio(
+        "Backend",
+        options=("Local subprocess", "Remote GPU server"),
+        index=1 if default_backend else 0,
+        help=(
+            "Local: launches scripts/auto_tune.py here (this host needs an MI300X). "
+            "Remote: POSTs to /auto-tune on a FastAPI server you've stood up on "
+            "the GPU host. Use Remote when running the UI on HF Spaces."
+        ),
+    )
+    backend_url = ""
+    if backend_mode == "Remote GPU server":
+        backend_url = st.text_input(
+            "Backend URL",
+            value=default_backend or "http://localhost:8000",
+            help="Base URL of the FastAPI server (no trailing slash). "
+            "/auto-tune is appended automatically.",
+        )
+
+    st.divider()
     workload_source = st.radio(
         "Workload source",
         options=("Model id", "Custom workload script"),
@@ -324,6 +347,29 @@ def _build_command(events_file: Path) -> list[str]:
     return cmd
 
 
+def _build_request_body() -> dict:
+    """Same config as _build_command, but as a JSON body for POST /auto-tune."""
+    body: dict[str, Any] = {
+        "mode": mode,
+        "steps": steps,
+        "max_iterations": max_iterations,
+        "early_stop_after": early_stop_after,
+        "max_crashes": max_crashes,
+        "improvement_threshold": float(improvement_threshold),
+    }
+    if mode == "llm-explore":
+        body["candidates_per_iteration"] = candidates_per_iteration
+    if workload_source == "Model id":
+        if not model_id.strip():
+            raise ValueError("Model id is required.")
+        body["model"] = model_id.strip()
+    else:
+        if not workload_path.strip():
+            raise ValueError("Workload path is required.")
+        body["workload"] = workload_path.strip()
+    return body
+
+
 def _read_events(path: Path, seen: int) -> tuple[list[dict], int]:
     """Read events from byte position `seen` onward; return (new_events, new_seen)."""
     if not path.exists():
@@ -389,24 +435,38 @@ if not run_pressed:
 # Run path: launch subprocess + tail events
 # ---------------------------------------------------------------------------
 
-events_file = Path(tempfile.NamedTemporaryFile(
-    prefix="auto_tune_events_", suffix=".ndjson", delete=False
-).name)
+st.subheader("Live run")
+header = st.empty()
 
+# Validate inputs early so the spinner doesn't show before a clear error
 try:
-    cmd = _build_command(events_file)
+    if backend_mode == "Local subprocess":
+        events_file = Path(tempfile.NamedTemporaryFile(
+            prefix="auto_tune_events_", suffix=".ndjson", delete=False
+        ).name)
+        cmd = _build_command(events_file)
+        with header.container():
+            st.code(" ".join(cmd), language="bash")
+            st.caption(f"Events stream: `{events_file}`")
+    else:
+        if not backend_url.strip():
+            raise ValueError("Backend URL is required for Remote GPU server mode.")
+        body = _build_request_body()
+        events_file = None
+        cmd = None
+        with header.container():
+            st.code(
+                f"POST {backend_url.rstrip('/')}/auto-tune\n"
+                + json.dumps(body, indent=2),
+                language="bash",
+            )
+            st.caption(
+                "Events stream: SSE from remote server. "
+                "All GPU work happens on that host."
+            )
 except ValueError as exc:
     st.error(str(exc))
     st.stop()
-
-# Persist run config & artifacts via session state for reruns later
-st.session_state["last_run_command"] = cmd
-
-st.subheader("Live run")
-header = st.empty()
-with header.container():
-    st.code(" ".join(cmd), language="bash")
-    st.caption(f"Events stream: `{events_file}`")
 
 baseline_metrics: dict | None = None
 best_metrics: dict | None = None  # most recent accepted iteration's metrics
@@ -417,140 +477,214 @@ metrics_row = st.empty()
 with metrics_row.container():
     _render_metrics_row(None, None)
 
-progress_bar = st.progress(0, text="Spawning auto_tune subprocess…")
+progress_bar = st.progress(0, text="Starting auto_tune…")
 
 iters_section = st.container()
 iters_section.subheader("Iterations")
 
-# Launch subprocess
-proc = subprocess.Popen(
-    cmd,
-    stdout=subprocess.PIPE,
-    stderr=subprocess.STDOUT,
-    text=True,
-    bufsize=1,
-    cwd=str(REPO_ROOT),
-    env={**os.environ},
-)
-
 stdout_buffer: list[str] = []
-seen_bytes = 0
-last_event_time = time.time()
 expected_iters = max(1, max_iterations)
+return_code: int | None = None
 
-try:
-    while True:
-        # Pull stdout incrementally so the user sees the raw script log too
+
+def _handle_event(event: dict) -> None:
+    """Render one event into the live UI. Mutates module-level state for
+    baseline/best_metrics/final_summary so the summary block below has
+    the data it needs after the run."""
+    global baseline_metrics, best_metrics, final_summary  # noqa: PLW0603
+    etype = event.get("type")
+    if etype == "started":
+        st.session_state["started_event"] = event
+    elif etype == "baseline":
+        baseline_metrics = event["metrics"]
+        best_metrics = baseline_metrics
+        with metrics_row.container():
+            _render_metrics_row(baseline_metrics, best_metrics)
+        with iters_section:
+            with st.container(border=True):
+                st.markdown("**Baseline**")
+                sub = st.columns(4)
+                sub[0].metric("tokens/sec", f"{baseline_metrics.get('tokens_per_sec', 0):,.0f}")
+                sub[1].metric("MFU %", f"{baseline_metrics.get('mfu_pct', 0):.2f}")
+                sub[2].metric("HBM peak GB", f"{baseline_metrics.get('hbm_peak_gb', 0):.1f}")
+                sub[3].metric("GPU util %", f"{baseline_metrics.get('gpu_util_pct', 0):.1f}")
+                wb = baseline_metrics.get("waste_budget") or {}
+                non_zero = {k: v for k, v in wb.items() if k != "useful_gpu" and v > 0}
+                if non_zero:
+                    wb_str = ", ".join(
+                        f"`{k}={v:.3f}`"
+                        for k, v in sorted(non_zero.items(), key=lambda kv: kv[1], reverse=True)
+                    )
+                    st.caption(f"Recoverable waste: {wb_str}")
+    elif etype == "iter_start":
+        i = event["iteration"]
+        with iters_section:
+            container = st.container(border=True)
+            iter_idx_to_container[i] = container
+            n_cand = len(event.get("candidates") or [])
+            cand_summary = ", ".join(
+                c.get("name", "?") for c in event.get("candidates") or []
+            )
+            container.markdown(
+                f"**Iteration {i}**  ·  {n_cand} candidate{'s' if n_cand != 1 else ''}: {cand_summary}"
+            )
+        progress_bar.progress(
+            min(0.99, (i - 1) / expected_iters),
+            text=f"Iteration {i} of up to {expected_iters} — proposed: {cand_summary}",
+        )
+    elif etype == "candidate":
+        i = event["iteration"]
+        container = iter_idx_to_container.get(i)
+        if container is not None:
+            with container:
+                _render_candidate_card(event)
+        progress_bar.progress(
+            min(0.99, (i - 1) / expected_iters + 0.05),
+            text=f"Iter {i} · candidate {event.get('candidate_index')}/"
+                 f"{event.get('n_candidates')}: {event.get('name')} "
+                 f"({event.get('outcome')})",
+        )
+    elif etype == "merge_attempt":
+        i = event["iteration"]
+        container = iter_idx_to_container.get(i)
+        if container is not None:
+            with container:
+                outcome = event.get("outcome", "?")
+                names = ", ".join(event.get("candidate_names") or [])
+                if outcome == "wins":
+                    delta = event.get("delta_vs_best", 0)
+                    container.success(
+                        f"🔗 MERGE WINS — combined ({names}) hit Δ {delta:+.2f}% "
+                        f"(beats individual best `{event.get('individual_best_name')}`)"
+                    )
+                elif outcome == "lost":
+                    delta = event.get("delta_vs_best", 0)
+                    container.info(
+                        f"🔗 Merge tested ({names}) — Δ {delta:+.2f}%, didn't beat "
+                        f"individual `{event.get('individual_best_name')}`"
+                    )
+                elif outcome == "crashed":
+                    container.warning(f"💥 Merge crashed: {names}")
+                else:
+                    container.info(f"🔗 Merge skipped: {event.get('reason', '?')}")
+    elif etype == "iter_done":
+        i = event["iteration"]
+        container = iter_idx_to_container.get(i)
+        outcome = event.get("outcome")
+        if container is not None:
+            with container:
+                if outcome == "accepted":
+                    container.success(
+                        f"✅ ACCEPTED — `{event.get('winner_name')}` "
+                        f"(Δ {event.get('winner_delta', 0):+.2f}%)"
+                    )
+                else:
+                    container.warning(
+                        f"⏭️ ALL REJECTED — best was `{event.get('winner_name')}` "
+                        f"(Δ {event.get('winner_delta', 0):+.2f}%, below threshold)"
+                    )
+        if outcome == "accepted" and event.get("best_metrics"):
+            best_metrics = event["best_metrics"]
+            with metrics_row.container():
+                _render_metrics_row(baseline_metrics, best_metrics)
+        progress_bar.progress(
+            min(0.99, i / expected_iters),
+            text=f"Iter {i} done — best so far: {event.get('best_tps', 0):,.0f} tok/s",
+        )
+    elif etype == "summary":
+        final_summary = event
+        progress_bar.progress(1.0, text="Auto-tune complete")
+    elif etype == "error":
+        st.error(event.get("message", "unknown error"))
+    elif etype == "process_exit":
+        rc = event.get("returncode", "?")
+        st.error(
+            f"Backend subprocess exited (code {rc}): "
+            + event.get("message", "")
+        )
+
+
+# ---- Source the events from either local subprocess or remote SSE ----
+if backend_mode == "Local subprocess":
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        cwd=str(REPO_ROOT),
+        env={**os.environ},
+    )
+
+    seen_bytes = 0
+    try:
         while True:
-            try:
-                line = proc.stdout.readline() if proc.stdout else ""
-            except Exception:
-                line = ""
-            if not line:
-                break
-            stdout_buffer.append(line.rstrip())
+            # Pull stdout incrementally so the user sees the raw script log too
+            while True:
+                try:
+                    line = proc.stdout.readline() if proc.stdout else ""
+                except Exception:
+                    line = ""
+                if not line:
+                    break
+                stdout_buffer.append(line.rstrip())
 
-        # Pull new events
-        new_events, seen_bytes = _read_events(events_file, seen_bytes)
-        for event in new_events:
-            last_event_time = time.time()
-            etype = event.get("type")
-            if etype == "started":
-                st.session_state["started_event"] = event
-            elif etype == "baseline":
-                baseline_metrics = event["metrics"]
-                best_metrics = baseline_metrics
-                with metrics_row.container():
-                    _render_metrics_row(baseline_metrics, best_metrics)
-                with iters_section:
-                    with st.container(border=True):
-                        st.markdown("**Baseline**")
-                        sub = st.columns(4)
-                        sub[0].metric("tokens/sec", f"{baseline_metrics.get('tokens_per_sec', 0):,.0f}")
-                        sub[1].metric("MFU %", f"{baseline_metrics.get('mfu_pct', 0):.2f}")
-                        sub[2].metric("HBM peak GB", f"{baseline_metrics.get('hbm_peak_gb', 0):.1f}")
-                        sub[3].metric("GPU util %", f"{baseline_metrics.get('gpu_util_pct', 0):.1f}")
-                        wb = baseline_metrics.get("waste_budget") or {}
-                        non_zero = {k: v for k, v in wb.items() if k != "useful_gpu" and v > 0}
-                        if non_zero:
-                            wb_str = ", ".join(
-                                f"`{k}={v:.3f}`"
-                                for k, v in sorted(non_zero.items(), key=lambda kv: kv[1], reverse=True)
-                            )
-                            st.caption(f"Recoverable waste: {wb_str}")
-            elif etype == "iter_start":
-                i = event["iteration"]
-                with iters_section:
-                    container = st.container(border=True)
-                    iter_idx_to_container[i] = container
-                    n_cand = len(event.get("candidates") or [])
-                    cand_summary = ", ".join(
-                        c.get("name", "?") for c in event.get("candidates") or []
-                    )
-                    container.markdown(
-                        f"**Iteration {i}**  ·  {n_cand} candidate{'s' if n_cand != 1 else ''}: {cand_summary}"
-                    )
-                progress_bar.progress(
-                    min(0.99, (i - 1) / expected_iters),
-                    text=f"Iteration {i} of up to {expected_iters} — proposed: {cand_summary}",
-                )
-            elif etype == "candidate":
-                i = event["iteration"]
-                container = iter_idx_to_container.get(i)
-                if container is not None:
-                    with container:
-                        _render_candidate_card(event)
-                progress_bar.progress(
-                    min(0.99, (i - 1) / expected_iters + 0.05),
-                    text=f"Iter {i} · candidate {event.get('candidate_index')}/"
-                         f"{event.get('n_candidates')}: {event.get('name')} "
-                         f"({event.get('outcome')})",
-                )
-            elif etype == "iter_done":
-                i = event["iteration"]
-                container = iter_idx_to_container.get(i)
-                outcome = event.get("outcome")
-                if container is not None:
-                    with container:
-                        if outcome == "accepted":
-                            container.success(
-                                f"✅ ACCEPTED — `{event.get('winner_name')}` "
-                                f"(Δ {event.get('winner_delta', 0):+.2f}%)"
-                            )
-                        else:
-                            container.warning(
-                                f"⏭️ ALL REJECTED — best was `{event.get('winner_name')}` "
-                                f"(Δ {event.get('winner_delta', 0):+.2f}%, below threshold)"
-                            )
-                if outcome == "accepted" and event.get("best_metrics"):
-                    best_metrics = event["best_metrics"]
-                    with metrics_row.container():
-                        _render_metrics_row(baseline_metrics, best_metrics)
-                progress_bar.progress(
-                    min(0.99, i / expected_iters),
-                    text=f"Iter {i} done — best so far: {event.get('best_tps', 0):,.0f} tok/s",
-                )
-            elif etype == "summary":
-                final_summary = event
-                progress_bar.progress(1.0, text="Auto-tune complete")
-
-        # Stop conditions
-        if proc.poll() is not None and not new_events:
-            # Drain any final events the process flushed
             new_events, seen_bytes = _read_events(events_file, seen_bytes)
-            if not new_events:
-                break
+            for event in new_events:
+                _handle_event(event)
 
-        time.sleep(0.4)
-finally:
-    if proc.poll() is None:
-        proc.terminate()
-        try:
-            proc.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+            if proc.poll() is not None and not new_events:
+                new_events, seen_bytes = _read_events(events_file, seen_bytes)
+                if not new_events:
+                    break
+            time.sleep(0.4)
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+    return_code = proc.returncode
+else:
+    # Remote SSE: stream from the FastAPI server
+    url = backend_url.rstrip("/") + "/auto-tune"
+    try:
+        response = requests.post(
+            url,
+            json=body,
+            stream=True,
+            timeout=(10, None),  # connect timeout 10s, read timeout indefinite
+            headers={"Accept": "text/event-stream"},
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        st.error(f"Failed to reach backend at {url}: {exc}")
+        st.stop()
 
-return_code = proc.returncode
+    try:
+        for raw_line in response.iter_lines(decode_unicode=True):
+            if not raw_line:
+                continue
+            stdout_buffer.append(raw_line)
+            # SSE framing: lines starting with `data: <json>`
+            if raw_line.startswith("data:"):
+                payload = raw_line[len("data:"):].strip()
+                try:
+                    event = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+                _handle_event(event)
+                if event.get("type") == "summary":
+                    # Final event; the server may still send a process_exit
+                    # but we can stop blocking the UI.
+                    pass
+            elif raw_line.startswith("event:") or raw_line.startswith(":"):
+                # SSE event-name line or comment — ignored
+                continue
+    except requests.RequestException as exc:
+        st.error(f"Stream interrupted: {exc}")
+    return_code = 0 if final_summary is not None else 1
 
 # ---------------------------------------------------------------------------
 # Final summary

@@ -1070,6 +1070,68 @@ def _experiment_fingerprint(exp: Experiment) -> tuple:
     return (subs, envs)
 
 
+def _build_merged_experiment(
+    exps: list[Experiment], base_source: str
+) -> tuple[Experiment | None, str]:
+    """Try to combine 2+ experiments into one. The merged experiment
+    applies all of their substitutions in sequence and unions their
+    env_vars. Returns (merged, "") on success, (None, reason) when the
+    merge is structurally unsafe — caller should fall back to using just
+    the individual winner.
+
+    Conflict detection:
+      - A later substitution's pattern must still match after earlier
+        substitutions have been applied (zero matches → conflict, e.g.
+        cand A rewrote `fp16=True` and cand B was also targeting it).
+      - Env var keys with conflicting values (same name, different value)
+        → conflict.
+      - Bad regex anywhere → conflict.
+    """
+    if len(exps) < 2:
+        return None, "need at least 2 experiments"
+
+    merged_subs: list[tuple[str, str]] = []
+    merged_envs: dict[str, str] = {}
+    test_source = base_source
+
+    for exp in exps:
+        for pattern, replacement in exp.substitutions:
+            try:
+                new_source, n = re.subn(pattern, replacement, test_source)
+            except re.error as e:
+                return None, f"bad regex in '{exp.name}': {e}"
+            if n == 0:
+                return None, (
+                    f"'{exp.name}' substitution {pattern!r} no longer matches "
+                    "after prior merges (likely overwrites an earlier change)"
+                )
+            test_source = new_source
+            merged_subs.append((pattern, replacement))
+        for k, v in exp.env_vars.items():
+            if k in merged_envs and merged_envs[k] != v:
+                return None, (
+                    f"env var conflict on {k!r}: {merged_envs[k]!r} vs {v!r}"
+                )
+            merged_envs[k] = v
+
+    short_names = "+".join(e.name[:14] for e in exps)
+    full_names = " + ".join(e.name for e in exps)
+    return (
+        Experiment(
+            name=f"merge[{short_names}]"[:60],
+            description=f"Merged: {full_names}",
+            rationale=(
+                f"Combined {len(exps)} candidates that each had positive delta "
+                "against the current best this iteration. Tests the compound "
+                "effect; falls back to the individual winner if it doesn't help."
+            ),
+            substitutions=merged_subs,
+            env_vars=merged_envs,
+        ),
+        "",
+    )
+
+
 def _is_duplicate_of_history(exp: Experiment, history: list[dict]) -> dict | None:
     """If `exp` matches a prior history entry by fingerprint, return that
     entry. Otherwise None."""
@@ -1617,6 +1679,114 @@ def main() -> int:
         else:
             winner = max(eval_results, key=lambda r: r["metrics"]["tokens_per_sec"])
             winner_delta = winner["delta_vs_best"]
+
+            # ---- Optional merge step (llm-explore only) ----
+            # If 2+ candidates this iteration each beat the baseline, try
+            # combining them into one experiment and benchmark the merge.
+            # The merge replaces `winner` only if it strictly exceeds the
+            # individual winner's tokens/sec.
+            if args.mode == "llm-explore":
+                positives = [r for r in eval_results if r["delta_vs_best"] > 0]
+                if len(positives) >= 2:
+                    merged_exp, merge_reason = _build_merged_experiment(
+                        [r["exp"] for r in positives], best_source
+                    )
+                    if merged_exp is None:
+                        print(f"\n  MERGE SKIPPED — {merge_reason}")
+                        _emit({
+                            "type": "merge_attempt",
+                            "iteration": i + 1,
+                            "outcome": "skipped",
+                            "reason": merge_reason,
+                            "candidate_names": [r["exp"].name for r in positives],
+                        })
+                    else:
+                        print(
+                            f"\n  Merging {len(positives)} positive candidates: "
+                            f"{merged_exp.description}"
+                        )
+                        # Apply substitutions to get the merged source
+                        merged_source = best_source
+                        for pattern, replacement in merged_exp.substitutions:
+                            merged_source = re.sub(pattern, replacement, merged_source)
+                        merged_env = {**best_env, **merged_exp.env_vars}
+
+                        file_counter += 1
+                        merged_path = workspace / f"{file_counter:03d}_iter{i + 1:02d}_merge.py"
+                        merged_path.write_text(merged_source)
+                        if merged_exp.env_vars:
+                            print(f"    env vars: {merged_exp.env_vars}")
+
+                        m = benchmark(merged_path, args.steps, merged_env)
+                        if m is None:
+                            total_crashes += 1
+                            crashed_this_iter = True
+                            print(
+                                f"    MERGE CRASHED — counted toward max-crashes "
+                                f"({total_crashes}/{args.max_crashes})"
+                            )
+                            _emit({
+                                "type": "merge_attempt",
+                                "iteration": i + 1,
+                                "outcome": "crashed",
+                                "candidate_names": [r["exp"].name for r in positives],
+                                "merged_name": merged_exp.name,
+                            })
+                            if total_crashes >= args.max_crashes:
+                                max_crashes_hit = True
+                        else:
+                            tps = m["tokens_per_sec"]
+                            delta_vs_best = _delta_pct(tps, best_tps)
+                            print(
+                                f"    Merged tokens/sec: {tps:.1f}  "
+                                f"(Δ {delta_vs_best:+.2f}% vs baseline)"
+                            )
+                            print(f"    mfu_pct:           {m.get('mfu_pct', 0.0):.2f}")
+                            print(f"    hbm_peak_gb:       {m['hbm_peak_gb']:.2f}")
+
+                            individual_best_tps = winner["metrics"]["tokens_per_sec"]
+                            if tps > individual_best_tps:
+                                print(
+                                    f"    MERGE WINS — exceeds individual winner "
+                                    f"'{winner['exp'].name}' "
+                                    f"({tps:.1f} > {individual_best_tps:.1f})"
+                                )
+                                _emit({
+                                    "type": "merge_attempt",
+                                    "iteration": i + 1,
+                                    "outcome": "wins",
+                                    "candidate_names": [r["exp"].name for r in positives],
+                                    "merged_name": merged_exp.name,
+                                    "metrics": m,
+                                    "delta_vs_best": delta_vs_best,
+                                    "individual_best_name": winner["exp"].name,
+                                    "individual_best_tps": individual_best_tps,
+                                })
+                                # Promote merged to be the new winner
+                                winner = {
+                                    "exp": merged_exp,
+                                    "candidate_source": merged_source,
+                                    "candidate_env": merged_env,
+                                    "metrics": m,
+                                    "delta_vs_best": delta_vs_best,
+                                }
+                                winner_delta = delta_vs_best
+                            else:
+                                print(
+                                    f"    Merge didn't beat individual winner; "
+                                    f"keeping '{winner['exp'].name}'"
+                                )
+                                _emit({
+                                    "type": "merge_attempt",
+                                    "iteration": i + 1,
+                                    "outcome": "lost",
+                                    "candidate_names": [r["exp"].name for r in positives],
+                                    "merged_name": merged_exp.name,
+                                    "metrics": m,
+                                    "delta_vs_best": delta_vs_best,
+                                    "individual_best_name": winner["exp"].name,
+                                    "individual_best_tps": individual_best_tps,
+                                })
 
             if winner_delta >= args.improvement_threshold:
                 print(
