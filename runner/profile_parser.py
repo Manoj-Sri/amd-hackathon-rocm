@@ -86,6 +86,13 @@ def parse(
     gpu_util_pct = smi.gpu_util_pct if smi.gpu_util_pct is not None else _gpu_util_from_kernels(
         kernels, torch_summary
     )
+    # Write the resolved gpu_util back into smi so _waste_budget sees the
+    # same number RunMetrics reports. Without this, a build where amd-smi's
+    # `usage` column returns N/A leaves smi.gpu_util_pct=None — and
+    # _waste_budget reads it as 0%, which forces host_gap to consume the
+    # full step time and collapses kernel_shape / precision_path to zero
+    # (both multiplied by gpu_util).
+    smi.gpu_util_pct = gpu_util_pct
 
     waste_budget = _waste_budget(
         kernels=kernels,
