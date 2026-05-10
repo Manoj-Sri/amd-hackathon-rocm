@@ -256,40 +256,93 @@ _LLM_SYSTEM_PROMPT = """\
 You are an expert at tuning AMD MI300X (ROCm 7.0, CDNA3 arch, 192 GB
 HBM3) training workloads. The user is iteratively benchmarking changes
 to a transformers/peft fine-tuning script. On each turn you suggest ONE
-specific parameter change to try next, targeting the largest waste
-bucket in the most recent benchmark.
+specific parameter change to try next, targeting the largest non-useful
+waste bucket in the most recent benchmark.
 
 Your output MUST be a single JSON object with this exact shape (no
 prose, no markdown fences, just the object):
 
 {
   "name": "short_snake_case_name",
-  "rationale": "1-3 sentences on why this targets the worst waste bucket",
+  "rationale": "1-3 sentences on why this change addresses the worst waste bucket",
   "substitutions": [["regex_pattern", "replacement"]],
   "env_vars": {"VAR_NAME": "value"}
 }
 
-Rules:
-- substitutions OR env_vars must be non-empty (one or both).
-- substitutions are applied with re.subn against the current workload
-  source. Patterns must match at least one occurrence — if your pattern
-  doesn't match, the experiment is auto-skipped.
-- Don't repeat any (name OR substitution OR env_var combo) from history.
-- If you cannot think of a productive next change, output:
-    {"name": "STOP", "rationale": "<why>", "substitutions": [], "env_vars": {}}
-  and the script will stop.
+CRITICAL output rules — read carefully:
 
-Anchor your reasoning in the KB rules below. Prefer changes that match a
-rule's transform shape over speculative ones.
+1. env_vars keys are LITERAL shell environment variable names. NEVER
+   prefix them with "env_vars." or any other dotted path. The KB rules
+   shown to you use dotted paths like `env_vars.MIOPEN_FIND_MODE`
+   because they describe a config dict — you must STRIP that prefix and
+   use just `MIOPEN_FIND_MODE` as the env var key.
+   Wrong:  {"env_vars.MIOPEN_FIND_MODE": "3"}
+   Right:  {"MIOPEN_FIND_MODE": "3"}
+
+2. substitutions are (regex_pattern, replacement) pairs applied with
+   re.subn against the current workload source. Patterns must match at
+   least one occurrence in the source — if zero matches, the experiment
+   is auto-skipped (counted as no improvement).
+
+3. When the previous change for a parameter improved tokens/sec, push
+   that parameter further in the same direction next time. E.g. if
+   batch_size 4 → 8 won, try 8 → 16. If 16 won and HBM is still under
+   ~150 GB, try 32. Don't be timid — MI300X has 192 GB HBM3.
+
+4. Don't repeat any (name OR substitution OR env_var combo) from
+   history. If a change was rejected, don't propose the same numerical
+   value again — try a different one.
+
+5. If you cannot think of a productive next change, output:
+     {"name": "STOP", "rationale": "<why>", "substitutions": [], "env_vars": {}}
+
+CONCRETE OUTPUT EXAMPLES — match this shape exactly:
+
+Switch fp16 → bf16 (precision_path bucket):
+  {"name": "bf16_over_fp16",
+   "rationale": "MI300X CDNA3 matrix cores prefer bf16: same throughput, larger numeric range, no loss-scaler.",
+   "substitutions": [["fp16=True", "bf16=True"], ["torch_dtype=torch\\\\.float16", "torch_dtype=torch.bfloat16"]],
+   "env_vars": {}}
+
+Increase batch size to 16 (memory_headroom bucket):
+  {"name": "batch_size_16",
+   "rationale": "Current HBM peak is well under 192 GB; bigger batch saturates the GPU.",
+   "substitutions": [["per_device_train_batch_size=\\\\d+", "per_device_train_batch_size=16"]],
+   "env_vars": {}}
+
+Switch attention to SDPA (kernel_shape bucket):
+  {"name": "sdpa_attention",
+   "rationale": "Eager attention is the slowest path; SDPA dispatches to a tuned kernel.",
+   "substitutions": [["attn_implementation=\\"eager\\"", "attn_implementation=\\"sdpa\\""]],
+   "env_vars": {}}
+
+Bump dataloader workers (data_wait bucket):
+  {"name": "dataloader_workers_4",
+   "rationale": "0 workers starves the GPU between batches.",
+   "substitutions": [["dataloader_num_workers=0", "dataloader_num_workers=4"]],
+   "env_vars": {}}
+
+Set MIOpen FAST mode (kernel_shape bucket, env-only):
+  {"name": "miopen_find_fast",
+   "rationale": "FAST mode picks already-tuned kernels without on-the-fly search.",
+   "substitutions": [],
+   "env_vars": {"MIOPEN_FIND_MODE": "3"}}
+
+Prefer hipBLASLt (kernel_shape bucket, env-only):
+  {"name": "prefer_hipblaslt",
+   "rationale": "hipBLASLt is faster than rocBLAS for Qwen GEMM shapes on MI300X.",
+   "substitutions": [],
+   "env_vars": {"TORCH_BLAS_PREFER_HIPBLASLT": "1"}}
 """
 
 
 _LLM_USER_TEMPLATE = """\
-KB rules (truncated):
+KB rules (one-liner per rule, for grounding):
 {kb_summary}
 
-Current workload (relevant lines):
-{config_snippet}
+Tunable parameters detected in the current workload — current literal
+values, and the regex pattern you'd use to change each:
+{tunables}
 
 Latest benchmark:
 - tokens_per_sec: {tps:.1f}
@@ -298,19 +351,25 @@ Latest benchmark:
 - waste_budget (seconds/step):
 {waste_lines}
 
+Sorted recoverable waste (largest first — go after these):
+{recoverable_sorted}
+
 History of changes already tried this run (newest first):
 {history_lines}
 
-Suggest ONE next change. JSON only.
+Suggest ONE next change targeting the largest recoverable bucket. JSON only.
 """
 
 
 def _kb_summary(rules_yaml_path: Path, max_chars: int = 6000) -> str:
     """Return a compact one-line-per-rule summary of kb/rocm_rules.yaml.
 
-    Truncated to keep prompt cost bounded. Each line carries the rule id,
-    targeted bucket, and a brief symptom + transform — enough for the LLM
-    to ground its suggestions without us shipping the full YAML.
+    Notably we DO NOT show the raw `transform` field — earlier versions
+    did and the LLM ended up copying its dotted-path notation literally
+    (`env_vars.MIOPEN_FIND_MODE` as the env var name, not as a dict
+    accessor). The system prompt's CONCRETE EXAMPLES section is the
+    canonical source of truth for output shape; this summary just
+    grounds the LLM's reasoning in the catalog of known issues.
     """
     if not rules_yaml_path.exists():
         return "(KB rules file not found)"
@@ -328,14 +387,118 @@ def _kb_summary(rules_yaml_path: Path, max_chars: int = 6000) -> str:
         rid = r.get("id", "?")
         bucket = r.get("targets_bucket", "?")
         sym = (r.get("symptom") or "").strip().replace("\n", " ")
-        if len(sym) > 100:
-            sym = sym[:97] + "..."
-        transform = r.get("transform") or {}
-        lines.append(f"- {rid} [{bucket}]: {sym}  → transform={transform}")
+        if len(sym) > 110:
+            sym = sym[:107] + "..."
+        lines.append(f"- {rid:55s} [{bucket}]  {sym}")
     text = "\n".join(lines)
     if len(text) > max_chars:
         text = text[:max_chars] + "\n... (truncated)"
     return text
+
+
+# Map of (substring-in-source) → (parameter description, example regex
+# pattern, example replacement template). Each entry is a hint shown to
+# the LLM so it has a concrete target to point its substitutions at —
+# instead of guessing what the workload's literal config text looks like.
+_TUNABLE_HINTS: list[tuple[str, str, str, str]] = [
+    # (token to detect, description, regex_for_substitution, replacement_template)
+    ("torch_dtype=torch.float16",
+     "model precision (matches `torch_dtype=torch.float16`)",
+     r"torch_dtype=torch\.float16",
+     "torch_dtype=torch.bfloat16"),
+    ("torch_dtype=torch.bfloat16",
+     "model precision (already bf16)",
+     r"torch_dtype=torch\.bfloat16",
+     "torch_dtype=torch.float16"),
+    ("fp16=True",
+     "TrainingArguments fp16 (matches `fp16=True`)",
+     r"\bfp16=True\b",
+     "bf16=True"),
+    ("bf16=True",
+     "TrainingArguments bf16 (already bf16)",
+     r"\bbf16=True\b",
+     "fp16=True"),
+    ("attn_implementation=\"eager\"",
+     "attention impl (matches `attn_implementation=\"eager\"`)",
+     r'attn_implementation="eager"',
+     'attn_implementation="sdpa"'),
+    ("attn_implementation=\"sdpa\"",
+     "attention impl (currently sdpa; could try flash_attention_2)",
+     r'attn_implementation="sdpa"',
+     'attn_implementation="flash_attention_2"'),
+    ("per_device_train_batch_size=",
+     "per-device batch size (matches `per_device_train_batch_size=<N>`)",
+     r"per_device_train_batch_size=\d+",
+     "per_device_train_batch_size=<NEW_VALUE>"),
+    ("dataloader_num_workers=",
+     "dataloader workers (matches `dataloader_num_workers=<N>`)",
+     r"dataloader_num_workers=\d+",
+     "dataloader_num_workers=<NEW_VALUE>"),
+    ("dataloader_pin_memory=",
+     "dataloader pin_memory (matches `dataloader_pin_memory=<bool>`)",
+     r"dataloader_pin_memory=(True|False)",
+     "dataloader_pin_memory=True"),
+    ("gradient_checkpointing=",
+     "gradient checkpointing toggle",
+     r"gradient_checkpointing=(True|False)",
+     "gradient_checkpointing=True"),
+    ("torch_compile=",
+     "torch.compile toggle (use cautiously on ROCm 7.x)",
+     r"torch_compile=(True|False)",
+     "torch_compile=True"),
+    ("optim=\"adamw_torch\"",
+     "optimizer choice (currently adamw_torch)",
+     r'optim="adamw_torch"',
+     'optim="adamw_torch_fused"'),
+]
+
+
+def _tunables_summary(source: str) -> str:
+    """Detect which tunable parameters are present in the workload source
+    and surface their current literal values + ready-to-use regex patterns
+    so the LLM has concrete substitution targets.
+
+    Skips comment lines when reporting the "current" value — many workloads
+    document expected findings in a top-of-file comment block, and we want
+    the LLM to see the live config line, not the doc string.
+    """
+    lines: list[str] = []
+    source_lines = source.splitlines()
+    for token, desc, pattern, replacement in _TUNABLE_HINTS:
+        live_line: str | None = None
+        for raw in source_lines:
+            stripped = raw.lstrip()
+            if stripped.startswith("#"):
+                continue
+            if token in raw:
+                live_line = raw.strip()
+                break
+        if live_line is None:
+            continue
+        lines.append(
+            f"  • {desc}\n"
+            f"    current: {live_line}\n"
+            f"    pattern: {pattern!r}    replacement template: {replacement!r}"
+        )
+    if not lines:
+        return "  (no recognized tunables — substitutions will need to match other text)"
+    return "\n".join(lines)
+
+
+def _recoverable_sorted(waste: dict) -> str:
+    """List the non-useful_gpu buckets sorted by size, so the LLM can
+    explicitly target the biggest one first."""
+    if not waste:
+        return "  (no waste_budget available)"
+    items = [
+        (name, value)
+        for name, value in waste.items()
+        if name != "useful_gpu" and isinstance(value, (int, float))
+    ]
+    items.sort(key=lambda kv: kv[1], reverse=True)
+    if not items:
+        return "  (no recoverable buckets)"
+    return "\n".join(f"  {i + 1}. {name:18s} = {value:.4f}" for i, (name, value) in enumerate(items))
 
 
 def _config_snippet(source: str, max_lines: int = 80) -> str:
@@ -446,13 +609,15 @@ async def _ask_llm_for_experiment(
     history: list[dict],
 ) -> Experiment | None:
     """One LLM turn → one Experiment (or None for STOP / parse failure)."""
+    waste = metrics.get("waste_budget") or {}
     prompt = _LLM_USER_TEMPLATE.format(
         kb_summary=kb_summary,
-        config_snippet=_config_snippet(source),
+        tunables=_tunables_summary(source),
         tps=metrics.get("tokens_per_sec", 0.0),
         util=metrics.get("gpu_util_pct", 0.0),
         hbm=metrics.get("hbm_peak_gb", 0.0),
-        waste_lines=_format_waste(metrics.get("waste_budget") or {}),
+        waste_lines=_format_waste(waste),
+        recoverable_sorted=_recoverable_sorted(waste),
         history_lines=_format_history(history),
     )
     backend.add_user_message(prompt)
@@ -482,12 +647,24 @@ async def _ask_llm_for_experiment(
         elif isinstance(entry, dict) and "pattern" in entry and "replacement" in entry:
             subs.append((str(entry["pattern"]), str(entry["replacement"])))
 
+    # Defensive: strip dotted-path prefixes from env var keys (e.g. the LLM
+    # emits `env_vars.MIOPEN_FIND_MODE` because it's mimicking the KB
+    # transform shape). The actual env var name is always the last segment.
+    cleaned_envs: dict[str, str] = {}
+    for k, v in envs.items():
+        key = str(k)
+        if "." in key:
+            stripped = key.rsplit(".", 1)[-1]
+            print(f"  [warn] LLM emitted dotted env key {key!r}; using {stripped!r} instead")
+            key = stripped
+        cleaned_envs[key] = str(v)
+
     return Experiment(
         name=name,
         description=obj.get("description") or name,
         rationale=str(obj.get("rationale") or ""),
         substitutions=subs,
-        env_vars={str(k): str(v) for k, v in envs.items()},
+        env_vars=cleaned_envs,
     )
 
 
