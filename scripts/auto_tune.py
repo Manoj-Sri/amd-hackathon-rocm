@@ -71,6 +71,24 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 GOBLIN_RUNNER = REPO_ROOT / "runner" / "goblin_runner.sh"
 sys.path.insert(0, str(REPO_ROOT))
 
+# Optional structured-events output. When `--events FILE` is passed, the
+# script appends one JSON object per line at key milestones (baseline,
+# iteration start, candidate done, iteration done, summary). Used by the
+# Streamlit UI to render progress live; CLI users typically don't need it.
+_EVENTS_PATH: Path | None = None
+
+
+def _emit(event: dict) -> None:
+    """Append one NDJSON event to the events file if one was configured."""
+    if _EVENTS_PATH is None:
+        return
+    try:
+        with _EVENTS_PATH.open("a") as f:
+            f.write(json.dumps(event, default=str) + "\n")
+            f.flush()  # so a UI tailing the file sees events promptly
+    except OSError:
+        pass  # never crash the run on an event-write failure
+
 # Default workload template — used when the user passes --model instead
 # of an explicit workload path. We just substitute MODEL_ID and reuse all
 # the other defaults (fp16, batch=4, eager attention, LoRA r=16, …).
@@ -1236,7 +1254,25 @@ def main() -> int:
             "noisy and you want to ignore sub-1%% deltas."
         ),
     )
+    p.add_argument(
+        "--events",
+        type=Path,
+        default=None,
+        help=(
+            "Optional NDJSON event stream output. If set, the script appends "
+            "one JSON event per line at baseline / iter / candidate / summary "
+            "milestones. Used by the Streamlit UI; CLI users don't need this."
+        ),
+    )
     args = p.parse_args()
+    if args.events is not None:
+        global _EVENTS_PATH
+        _EVENTS_PATH = args.events
+        try:
+            args.events.write_text("")  # truncate any prior contents
+        except OSError as exc:
+            sys.stderr.write(f"--events: cannot open {args.events} for writing ({exc})\n")
+            return 1
     if args.max_iterations <= 0:
         if args.mode == "hardcoded":
             args.max_iterations = len(EXPERIMENTS)
@@ -1279,6 +1315,21 @@ def main() -> int:
         workload_label += f"   {workload}\n                     "
         workload_label += f"   template: {_DEFAULT_WORKLOAD_TEMPLATE}"
 
+    _emit({
+        "type": "started",
+        "mode": args.mode,
+        "workload": str(workload),
+        "model": args.model,
+        "steps": args.steps,
+        "max_iterations": args.max_iterations,
+        "early_stop_after": args.early_stop_after,
+        "max_crashes": args.max_crashes,
+        "improvement_threshold": args.improvement_threshold,
+        "candidates_per_iteration": (
+            args.candidates_per_iteration if args.mode == "llm-explore" else 1
+        ),
+        "workspace": str(workspace),
+    })
     print(f"Auto-tune workspace: {workspace}")
     print(f"Mode:                {args.mode}")
     print(f"Workload:            {workload_label}")
@@ -1327,6 +1378,7 @@ def main() -> int:
         "  waste_budget:  "
         + ", ".join(f"{k}={v:.3f}" for k, v in baseline["waste_budget"].items() if v > 0)
     )
+    _emit({"type": "baseline", "metrics": baseline})
 
     best_source = baseline_source
     best_tps = baseline_tps
@@ -1393,6 +1445,19 @@ def main() -> int:
         n_label = f" ({len(candidates)} candidates)" if len(candidates) > 1 else ""
         print(f"Iteration {i + 1}{n_label}")
         print("=" * 60)
+        _emit({
+            "type": "iter_start",
+            "iteration": i + 1,
+            "candidates": [
+                {
+                    "name": c.name,
+                    "rationale": c.rationale,
+                    "substitutions": c.substitutions,
+                    "env_vars": c.env_vars,
+                }
+                for c in candidates
+            ],
+        })
 
         # ---- Evaluate each candidate against the CURRENT best ----
         # Crucial for llm-explore: every candidate is benchmarked against
@@ -1410,6 +1475,26 @@ def main() -> int:
             print(f"    description: {exp.description}")
             print(f"    rationale:   {exp.rationale}")
 
+            # Helper to emit a per-candidate event with the consistent shape
+            # the UI expects. Called at every terminus below.
+            def _cand_event(outcome: str, metrics: dict | None = None,
+                            delta_vs_best: float | None = None,
+                            reason: str = "") -> None:
+                _emit({
+                    "type": "candidate",
+                    "iteration": i + 1,
+                    "candidate_index": j + 1,
+                    "n_candidates": len(candidates),
+                    "name": exp.name,
+                    "rationale": exp.rationale,
+                    "substitutions": exp.substitutions,
+                    "env_vars": exp.env_vars,
+                    "outcome": outcome,
+                    "metrics": metrics,
+                    "delta_vs_best": delta_vs_best,
+                    "reason": reason,
+                })
+
             # Dedup: against prior iterations' history
             dup = _is_duplicate_of_history(exp, history)
             if dup is not None:
@@ -1420,6 +1505,7 @@ def main() -> int:
                     "delta_pct": None,
                     "substitutions": exp.substitutions, "env_vars": exp.env_vars,
                 })
+                _cand_event("skipped", reason=f"duplicate of '{dup.get('name', '?')}'")
                 continue
 
             # Dedup: within the current batch (llm-explore can collide)
@@ -1431,6 +1517,7 @@ def main() -> int:
                     "delta_pct": None,
                     "substitutions": exp.substitutions, "env_vars": exp.env_vars,
                 })
+                _cand_event("skipped", reason="duplicate of an earlier candidate this iteration")
                 continue
             seen_this_iter.add(fp)
 
@@ -1446,6 +1533,7 @@ def main() -> int:
                         "delta_pct": None,
                         "substitutions": exp.substitutions, "env_vars": exp.env_vars,
                     })
+                    _cand_event("rejected", reason=f"bad regex: {exc}")
                     continue
                 if candidate_source is None:
                     print("    SKIPPED — substitution patterns didn't match")
@@ -1455,6 +1543,7 @@ def main() -> int:
                         "delta_pct": None,
                         "substitutions": exp.substitutions, "env_vars": exp.env_vars,
                     })
+                    _cand_event("skipped", reason="substitution patterns didn't match")
                     continue
             else:
                 candidate_source = best_source
@@ -1482,6 +1571,7 @@ def main() -> int:
                     f"    CRASHED — counted toward max-crashes "
                     f"({total_crashes}/{args.max_crashes})"
                 )
+                _cand_event("crashed", reason="benchmark subprocess failed")
                 if total_crashes >= args.max_crashes:
                     max_crashes_hit = True
                     break
@@ -1494,6 +1584,12 @@ def main() -> int:
             print(f"    hbm_peak_gb: {m['hbm_peak_gb']:.2f}")
             print(f"    gpu_util_pct:{m['gpu_util_pct']:.1f}")
             _print_waste(m, prefix="    waste:       ")
+
+            # Emit "evaluated" — outcome (accepted/rejected) is decided
+            # later when the iteration's winner is picked across all
+            # candidates. For UI display purposes the per-candidate metrics
+            # are already useful.
+            _cand_event("evaluated", metrics=m, delta_vs_best=delta_vs_best)
 
             eval_results.append({
                 "exp": exp,
@@ -1550,6 +1646,16 @@ def main() -> int:
                         "env_vars": r["exp"].env_vars,
                     })
                 consecutive_no_improvement = 0
+                _emit({
+                    "type": "iter_done",
+                    "iteration": i + 1,
+                    "outcome": "accepted",
+                    "winner_name": winner["exp"].name,
+                    "winner_delta": winner_delta,
+                    "best_tps": best_tps,
+                    "best_metrics": winner["metrics"],
+                    "best_env_vars": best_env,
+                })
             else:
                 print(
                     f"\n  ALL REJECTED — best candidate '{winner['exp'].name}' "
@@ -1568,6 +1674,14 @@ def main() -> int:
                 if args.mode in ("llm", "llm-explore"):
                     last_metrics = winner["metrics"]
                 consecutive_no_improvement += 1
+                _emit({
+                    "type": "iter_done",
+                    "iteration": i + 1,
+                    "outcome": "all_rejected",
+                    "winner_name": winner["exp"].name,
+                    "winner_delta": winner_delta,
+                    "best_tps": best_tps,
+                })
 
         if consecutive_no_improvement >= args.early_stop_after:
             print(
@@ -1607,6 +1721,26 @@ def main() -> int:
 
     print(f"Best workload script:  {best_path}")
     print(f"Diff vs baseline:      diff {workload} {best_path}")
+
+    _emit({
+        "type": "summary",
+        "baseline_metrics": baseline,
+        "best_metrics": last_metrics,
+        "baseline_tps": baseline_tps,
+        "best_tps": best_tps,
+        "improvement_pct": _delta_pct(best_tps, baseline_tps),
+        "accepted": [
+            {"name": name, "tps": tps, "delta_pct": delta}
+            for name, tps, delta in accepted
+        ],
+        "rejected": [
+            {"name": name, "reason": reason}
+            for name, reason in rejected
+        ],
+        "best_env_vars": best_env,
+        "best_workload_path": str(best_path),
+        "baseline_workload_path": str(workload),
+    })
     return 0
 
 
