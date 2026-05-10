@@ -146,7 +146,6 @@ trainer = Trainer(
     model=model,
     args=training_args,
     train_dataset=dataset,
-    tokenizer=tokenizer,
     data_collator=_toy_collate,
 )
 

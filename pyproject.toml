@@ -26,6 +26,24 @@ dev = [
   "pytest-asyncio>=0.23",
   "ruff>=0.4",
 ]
+# Workload-execution stack — only needed when goblin_runner.sh actually runs
+# workloads/train_qwen_lora.py on an MI300X.
+#
+# `torch` is DELIBERATELY NOT LISTED HERE. The official ROCm/PyTorch
+# containers ship `torch+rocm` preinstalled, and adding `torch` to this
+# extra would let pip silently overwrite that with the default CPU-only
+# PyPI wheel — which is exactly how a container with a working ROCm
+# torch ends up running on CPU after a `pip install -e ".[runtime]"`.
+# Install the HF stack on top of the container's torch and trust the
+# container.
+#
+# `bitsandbytes` is also intentionally omitted — the bnb scenario is
+# supposed to fail on ROCm; that's the bug it demonstrates.
+runtime = [
+  "transformers>=4.40",
+  "datasets>=2.16",
+  "peft>=0.10",
+]
 
 [build-system]
 requires = ["setuptools>=68"]

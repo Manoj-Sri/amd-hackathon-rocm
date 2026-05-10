@@ -203,14 +203,32 @@ def _read_kernels(path: Path, warnings: list[str]) -> list[_Kernel]:
 
 
 def _pick_column(fieldnames: list[str], candidates: list[str]) -> str | None:
+    """Pick the first matching column name, with three fallback tiers:
+        1. Exact match.
+        2. Case-insensitive exact match.
+        3. Substring match (case-insensitive) — every token of any candidate
+           must appear somewhere in the field name. Tolerates the column-name
+           drift between rocprofv3 / amd-smi versions (e.g. `VRAM_USED` vs
+           `vram_used_mb` vs `VRAM USED MB`).
+    """
     for c in candidates:
         if c in fieldnames:
             return c
-    # case-insensitive fallback
     lower = {f.lower(): f for f in fieldnames}
     for c in candidates:
         if c.lower() in lower:
             return lower[c.lower()]
+    # Substring tier: split each candidate on _/space, require all tokens
+    # appear in the (lowercased) field name. Avoids matching too eagerly
+    # by requiring every token of the candidate.
+    for c in candidates:
+        tokens = [t for t in c.lower().replace("_", " ").split() if t]
+        if not tokens:
+            continue
+        for fname in fieldnames:
+            fl = fname.lower()
+            if all(t in fl for t in tokens):
+                return fname
     return None
 
 
@@ -391,7 +409,7 @@ def _read_amd_smi(path: Path, warnings: list[str]) -> _SmiSummary:
     """Aggregate amd-smi polling output into HBM peak/avg + GPU util."""
     summary = _SmiSummary()
     if not path.exists():
-        warnings.append(f"profile_parser: amd-smi telemetry not found at {path}")
+        warnings.append(_amd_smi_missing_reason(path))
         return summary
 
     try:
@@ -401,10 +419,36 @@ def _read_amd_smi(path: Path, warnings: list[str]) -> _SmiSummary:
                 warnings.append(f"profile_parser: empty amd-smi telemetry at {path}")
                 return summary
             hbm_col = _pick_column(
-                reader.fieldnames, ["VRAM_USED", "VRAM_USED_GB", "vram_used", "VRAM Used", "MEM_USED"]
+                reader.fieldnames,
+                [
+                    # ROCm 7.x amd-smi --vram-usage emits "VRAM_USED" or
+                    # "vram_used_mb" depending on minor version
+                    "VRAM_USED_MB",
+                    "vram_used_mb",
+                    "VRAM_USED",
+                    "VRAM_USED_GB",
+                    "vram_used",
+                    "VRAM Used",
+                    # Older rocm 6.x naming
+                    "MEM_USED",
+                    "mem_used",
+                ],
             )
             util_col = _pick_column(
-                reader.fieldnames, ["GFX_ACTIVITY", "GPU_USE", "gfx_activity", "GFX %", "Util"]
+                reader.fieldnames,
+                [
+                    # ROCm 7.x: --gfx flag → "gfx_util" / "GFX_UTIL"
+                    "GFX_UTIL",
+                    "gfx_util",
+                    "GFX_UTILIZATION",
+                    "gfx_utilization",
+                    # rocm 6.x and older
+                    "GFX_ACTIVITY",
+                    "gfx_activity",
+                    "GPU_USE",
+                    "GFX %",
+                    "Util",
+                ],
             )
             rocm_col = _pick_column(reader.fieldnames, ["ROCM_VERSION", "rocm_version"])
 
@@ -432,6 +476,51 @@ def _read_amd_smi(path: Path, warnings: list[str]) -> _SmiSummary:
     except (OSError, csv.Error) as exc:
         warnings.append(f"profile_parser: failed to read amd-smi telemetry ({exc})")
         return summary
+
+
+def _amd_smi_missing_reason(csv_path: Path) -> str:
+    """Build a self-diagnostic warning when amd_smi.csv is absent.
+
+    goblin_runner.sh's start_amd_smi() drops one of two sidecar files when
+    telemetry is intentionally skipped — surface its contents so the user
+    doesn't have to dig into a vanished /tmp dir to figure out why HBM
+    util/rocm_version came back empty.
+    """
+    out_dir = csv_path.parent
+    skipped = out_dir / "amd_smi.skipped"
+    err = out_dir / "amd_smi.err"
+
+    base = f"profile_parser: amd-smi telemetry not found at {csv_path}"
+    detail: str | None = None
+    if skipped.exists():
+        try:
+            msg = skipped.read_text().strip()
+        except OSError:
+            msg = ""
+        detail = (
+            f"goblin_runner.sh deliberately skipped telemetry "
+            f"(amd_smi.skipped: {msg or 'no detail'}). "
+            "HBM/GPU-util will fall back to kernel-trace estimates."
+        )
+    elif err.exists():
+        try:
+            tail = err.read_text().strip().splitlines()[-3:]
+        except OSError:
+            tail = []
+        detail = (
+            "amd-smi sidecar wrote an error log "
+            f"(amd_smi.err tail: {tail!r}). "
+            "Check the amd-smi flag matrix in goblin_runner.sh:start_amd_smi()."
+        )
+    elif not out_dir.exists():
+        detail = (
+            "the runner's tempdir was already cleaned up — these metrics are "
+            "almost certainly being replayed from bench_cache/. Pass cache=False "
+            "(or delete the matching bench_cache/<hash>.json) to re-run live."
+        )
+    if detail:
+        return f"{base}. {detail}"
+    return base
 
 
 def _hbm_to_gb(raw: str | None) -> float | None:

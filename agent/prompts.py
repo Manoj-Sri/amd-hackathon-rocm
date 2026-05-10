@@ -31,8 +31,31 @@ Run the tools roughly in this order:
 3. query_rocm_kb(symptoms=[...]) — search the curated rule base. You may \
    pass a single ``symptom`` string OR an array of related ``symptoms`` to \
    batch the search (returns deduplicated union of top-k hits per query). \
-   Derive symptoms from what profile_run revealed: precision, attention \
-   impl, dataloader workers, NCCL knobs, etc.
+   \
+   CRITICAL: derive symptoms from BOTH (a) the parsed WorkloadConfig and \
+   (b) the profile_run waste_budget. Don't only query for the dominant \
+   waste bucket — that misses static-config issues (fp16, eager attention, \
+   missing env vars) which often dominate the real speedup. \
+   \
+   Concretely, scan WorkloadConfig and emit a symptom string for EACH of \
+   these fields when they hold a non-optimal value: \
+     • precision == "fp16" or "fp32"  → "fp16/fp32 used on MI300X CDNA3" \
+     • attention_impl == "eager"      → "naive eager attention on MI300X" \
+     • dataloader_workers == 0        → "DataLoader num_workers=0 starves GPU" \
+     • dataloader_pin_memory == false → "DataLoader pin_memory=False" \
+     • dataloader_persistent_workers == false → "DataLoader workers respawn each epoch" \
+     • gradient_checkpointing == false at long seq_len → "no gradient checkpointing at long context" \
+     • torch_compile == false         → "torch.compile disabled on Qwen-class model" \
+     • optimizer contains "bnb" / "8bit" → "bitsandbytes optimizer on ROCm" \
+     • env_vars missing NCCL_MIN_NCHANNELS → "NCCL_MIN_NCHANNELS not set" \
+   \
+   Then add waste-budget symptoms: any non-zero bucket in waste_budget \
+   (data_wait, host_gap, comm_excess, memory_headroom, precision_path, \
+   kernel_shape) deserves its own query string. \
+   \
+   Batching all of these in ONE call (symptoms=[...]) is preferred — \
+   query_rocm_kb deduplicates rules across queries, so there's no penalty \
+   for over-querying.
 4. propose_patch(config, rule_ids, metrics) — deterministic rule-to-config diff.
 5. benchmark(config, steps=50) on the original AND the patched config — both \
    runs are needed for the side-by-side. The bench cache makes repeats free.

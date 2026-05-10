@@ -44,19 +44,38 @@ start_amd_smi() {
             > "$OUT_DIR/amd_smi.err"
         return 1
     fi
-    # `amd-smi monitor` flag surface drifted across rocm versions:
-    #   - some ship `--violation` and reject e.g. `--gpu-usage`
-    #   - some ship `--watch` (seconds), some `--interval`
-    #   - some accept just `monitor` with no flags
-    # Try the safest variants first, give each ~0.5s to either start
-    # emitting or die. Stop on the first one that survives.
+    # amd-smi telemetry surface drifted hard across rocm versions. We try
+    # subcommands in this order, newest-first; first one that survives 0.5s
+    # is kept:
+    #
+    #   1. `amd-smi metric --watch <s> --mem-usage --usage --csv` (ROCm 7.x).
+    #      Different code path from `monitor`, so it dodges the known
+    #      `AttributeError: 'Namespace' object has no attribute 'violation'`
+    #      crash that some ROCm 7.x point releases ship inside the `monitor`
+    #      subcommand. Produces VRAM_USED_MB / GFX_ACTIVITY / MEM_ACTIVITY
+    #      columns that profile_parser._pick_column already recognises.
+    #
+    #   2. `amd-smi monitor --watch <s> ...` (ROCm 6.x and the 7.x builds
+    #      where `monitor` actually works). Kept as a fallback for older
+    #      installs that may not have the `metric --watch` form.
+    #
+    #   3. `amd-smi monitor --interval <s>` (pre-6.0) and finally bare
+    #      `amd-smi monitor` (very old / implicit-all).
     local variants=(
+        # ROCm 7.x: prefer the metric subcommand — bypasses the monitor bug.
+        "amd-smi metric --watch 1 --mem-usage --usage --csv"
+        "amd-smi metric -w 1 -m -u --csv"
+        # ROCm 7.x monitor (works on builds without the violation-attribute bug)
+        "amd-smi monitor --watch 1 --power-usage --gfx --mem --vram-usage --csv"
+        "amd-smi monitor -w 1 -p -u -m -v --csv"
+        # ROCm 6.x intermediate forms
+        "amd-smi monitor --watch 1 --csv"
+        "amd-smi monitor --watch 1"
+        # Older / fallback
+        "amd-smi monitor --interval 1 --csv"
+        "amd-smi monitor --interval 1"
         "amd-smi monitor --csv"
         "amd-smi monitor"
-        "amd-smi monitor --watch 1"
-        "amd-smi monitor --watch 1 --csv"
-        "amd-smi monitor --interval 1"
-        "amd-smi monitor --interval 1 --csv"
     )
     for cmd in "${variants[@]}"; do
         # shellcheck disable=SC2086

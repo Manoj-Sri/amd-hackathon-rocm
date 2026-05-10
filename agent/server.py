@@ -23,9 +23,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 
 from agent.backends import active_backend_name
+from agent.logging_setup import configure as _configure_logging
 from agent.loop import run_audit
 from agent.schemas import SSEEvent
 from agent.tools import ALL_TOOLS
+
+_configure_logging()
 
 app = FastAPI(title="GPU Goblin Agent", version="0.1.0")
 

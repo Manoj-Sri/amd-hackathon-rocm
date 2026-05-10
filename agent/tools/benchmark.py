@@ -22,6 +22,7 @@ import hashlib
 import json
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -90,6 +91,18 @@ def _cache_path(key: str) -> Path:
     return _CACHE_DIR / f"{key}.json"
 
 
+def _humanize_seconds(seconds: float) -> str:
+    if seconds < 0:
+        return "in the future?"
+    if seconds < 60:
+        return f"{seconds:.0f}s ago"
+    if seconds < 3600:
+        return f"{seconds / 60:.1f}m ago"
+    if seconds < 86400:
+        return f"{seconds / 3600:.1f}h ago"
+    return f"{seconds / 86400:.1f}d ago"
+
+
 def _read_cache(key: str) -> dict[str, Any] | None:
     path = _cache_path(key)
     if not path.exists():
@@ -138,6 +151,25 @@ def _benchmark(
     Live-AMD-GPU lesson: the LLM tends to pass ``cache: true`` when it means
     "use the cache" — make that work directly.
     """
+    # Defensive: Qwen2.5-7B occasionally nests ``steps`` / ``cache`` /
+    # ``force_rerun`` *inside* the config dict instead of at the top level
+    # alongside it. WorkloadConfig strict-validates extras, so the call
+    # would error out and waste a tool slot. Extract them back to the
+    # top-level args, with the caller's explicit values winning ties.
+    if isinstance(config, dict):
+        misnested_steps = config.pop("steps", None)
+        misnested_cache = config.pop("cache", None)
+        misnested_force = config.pop("force_rerun", None)
+        if misnested_steps is not None and steps == 50:
+            try:
+                steps = int(misnested_steps)
+            except (TypeError, ValueError):
+                pass
+        if misnested_cache is not None and cache is True:
+            cache = bool(misnested_cache)
+        if misnested_force is not None and force_rerun is None:
+            force_rerun = bool(misnested_force)
+
     if force_rerun is not None:
         # Explicit force_rerun overrides cache; legacy callers keep working.
         use_cache = not force_rerun
@@ -151,8 +183,18 @@ def _benchmark(
         if cached is not None:
             metrics_dict = cached.get("metrics", cached)
             metrics = RunMetrics.model_validate(metrics_dict)
+            cache_file = _cache_path(key)
+            try:
+                age = time.time() - cache_file.stat().st_mtime
+                age_str = _humanize_seconds(age)
+            except OSError:
+                age_str = "unknown age"
             metrics.warnings = [
-                "benchmark: cache hit (pass cache=False to bypass)",
+                (
+                    f"benchmark: cache hit (key={key[:12]}…, "
+                    f"file={cache_file}, age={age_str}). "
+                    "Pass cache=False or delete that file to force a fresh live run."
+                ),
                 *metrics.warnings,
             ]
             return ToolResult(ok=True, result=metrics.model_dump())
