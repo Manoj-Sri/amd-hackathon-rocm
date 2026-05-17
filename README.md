@@ -1,25 +1,3 @@
----
-title: GPU Goblin
-emoji: 🧌
-colorFrom: red
-colorTo: red
-sdk: streamlit
-sdk_version: "1.32.0"
-app_file: ui/auto_tune_ui.py
-pinned: false
-license: mit
-short_description: AI auto-tuner for MI300X fine-tuning workloads.
-tags:
-  - amd
-  - mi300x
-  - rocm
-  - qwen
-  - huggingface
-  - agent
-  - fine-tuning
-  - llm
----
-
 # GPU Goblin
 
 > An AI agent that hunts wasted compute on AMD MI300X. Powered by Qwen.
