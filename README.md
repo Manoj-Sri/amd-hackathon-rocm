@@ -69,7 +69,7 @@ agent/
   tools/         # 6 tools the agent can call
   loop.py        # Provider-agnostic tool-use loop
   server.py      # FastAPI + SSE
-runner/          # GPU runner (rocprofv3 wrapper) + FakeRunner fallback
+runner/          # GPU runner (rocprofv3 wrapper) + MockRunner fallback
 kb/              # ROCm knowledge base (22 curated rules, the moat)
 ui/              # Streamlit chat UI
 workloads/       # Canonical Qwen demo + synthetic corpus
@@ -79,9 +79,9 @@ brainstorming/   # Design docs (idea / architecture / goals)
 
 ## Development
 
-The agent loop is testable on a laptop without an MI300X via the `FakeRunner`
+The agent loop is testable on a laptop without an MI300X via the `MockRunner`
 and the synthetic corpus in `workloads/synthetic/`. Real benchmarks require
-ROCm + MI300X (the `LiveRunner` auto-falls-back to `FakeRunner` when
+ROCm + MI300X (the `LiveRunner` auto-falls-back to `MockRunner` when
 `rocprofv3` / `amd-smi` / a render device are missing).
 
 ```bash
@@ -134,7 +134,7 @@ python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_
 # → True MI300X
 ```
 
-If any of these fail, `LiveRunner` will fall back to `FakeRunner` — the
+If any of these fail, `LiveRunner` will fall back to `MockRunner` — the
 agent loop still works, but you get cached metrics instead of a real
 benchmark. Don't chase the bug; the demo lane is intact.
 
@@ -172,7 +172,7 @@ open `http://localhost:8501` locally.
 - Cache benchmark results (`bench_cache/` is content-addressed by config +
   workload SHA + container tag, so identical configs are free).
 - Day-1 baseline run is the only "must-burn-GPU" task; everything else can
-  use cached metrics or the FakeRunner.
+  use cached metrics or the MockRunner.
 - Stop the instance between work sessions. AMD Developer Cloud bills only
   for running time.
 - Public reference price: ~$1.99/GPU-hour for MI300X VMs. ~$8 of your $100

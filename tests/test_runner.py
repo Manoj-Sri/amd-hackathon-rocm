@@ -1,8 +1,8 @@
 """Tests for runner/protocol.py and runner/profile_parser.py.
 
 Two laptop-only invariants:
-  1. FakeRunner still works exactly as before (the Phase 1 contract).
-  2. LiveRunner gracefully falls back to FakeRunner whenever GPU/profiler
+  1. MockRunner still works exactly as before (the Phase 1 contract).
+  2. LiveRunner gracefully falls back to MockRunner whenever GPU/profiler
      tools are missing — this dev box has no AMD GPU, so every test here
      should exercise the fallback path.
 """
@@ -18,7 +18,7 @@ import pytest
 
 from agent.schemas import RunMetrics, WorkloadConfig
 from runner import profile_parser
-from runner.protocol import FakeRunner, LiveRunner, _default_runner, gpu_available
+from runner.protocol import MockRunner, LiveRunner, _default_runner, gpu_available
 
 
 # ---------------------------------------------------------------------------
@@ -37,13 +37,13 @@ def _baseline_config() -> WorkloadConfig:
 
 
 # ---------------------------------------------------------------------------
-# FakeRunner — unchanged contract
+# MockRunner — unchanged contract
 # ---------------------------------------------------------------------------
 
 
-class TestFakeRunner:
+class TestMockRunner:
     def test_matches_baseline_scenario(self):
-        runner = FakeRunner()
+        runner = MockRunner()
         metrics = runner.run(_baseline_config(), steps=10)
         assert isinstance(metrics, RunMetrics)
         assert metrics.runner_kind == "fake"
@@ -52,21 +52,21 @@ class TestFakeRunner:
         assert metrics.tokens_per_sec == pytest.approx(142.0)
 
     def test_steps_override_takes_precedence(self):
-        runner = FakeRunner()
+        runner = MockRunner()
         metrics = runner.run(_baseline_config(), steps=99)
         assert metrics.steps == 99
 
     def test_default_metrics_when_no_match(self):
-        runner = FakeRunner()
+        runner = MockRunner()
         # An unknown model_name forces the no-match path.
         cfg = _baseline_config().model_copy(update={"model_name": "unknown/model"})
         metrics = runner.run(cfg, steps=7)
         assert metrics.runner_kind == "fake"
         assert metrics.steps == 7
-        assert any("FakeRunner" in w for w in metrics.warnings)
+        assert any("MockRunner" in w for w in metrics.warnings)
 
     def test_corpus_dir_missing_returns_default(self, tmp_path):
-        runner = FakeRunner(corpus_dir=tmp_path / "nope")
+        runner = MockRunner(corpus_dir=tmp_path / "nope")
         metrics = runner.run(_baseline_config(), steps=10)
         assert metrics.runner_kind == "fake"
 
@@ -120,7 +120,7 @@ class TestLiveRunnerFallback:
     def test_falls_back_when_gpu_unavailable(self):
         runner = LiveRunner()
         metrics = runner.run(_baseline_config(), steps=10)
-        # On a laptop, gpu_available() returns False → FakeRunner path.
+        # On a laptop, gpu_available() returns False → MockRunner path.
         assert metrics.runner_kind == "fake"
         # The warning must be the FIRST entry (LiveRunner prepends it).
         assert metrics.warnings, "LiveRunner must surface a fallback warning"

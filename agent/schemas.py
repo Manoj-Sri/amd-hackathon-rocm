@@ -156,7 +156,7 @@ class RunMetrics(BaseModel):
     rocm_version: str = "unknown"
     pytorch_version: str = "unknown"
     runner_kind: Literal["live", "fake"] = "live"
-    """Whether these metrics came from a real MI300X (live) or FakeRunner replay."""
+    """Whether these metrics came from a real MI300X (live) or MockRunner replay."""
 
 
 # ---------------------------------------------------------------------------

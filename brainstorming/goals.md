@@ -69,7 +69,7 @@ Roles overlap on integration days — pair-program when blocked.
 - [ ] Repo scaffold per architecture.md layout
 - [ ] `pip install fastapi anthropic sentence-transformers pyyaml pydantic`
 - [ ] Define `agent/schemas.py` with `RunMetrics`, `WasteBudget`, `ConfigDict`, `Patch`, `Rule`, `Report` as pydantic models — **Day-1 priority** (blocks all tools)
-- [ ] Define `RunnerProtocol` interface; build `FakeRunner` that loads cached metrics from `workloads/synthetic/` (lets backend dev without MI300X)
+- [ ] Define `RunnerProtocol` interface; build `MockRunner` that loads cached metrics from `workloads/synthetic/` (lets backend dev without MI300X)
 - [ ] FastAPI `POST /audit` skeleton with SSE
 - [ ] `parse_config` tool — handle HF `TrainingArguments` first; include regex redaction pass for tokens/paths
 - [ ] Qwen tool-use hello-world (one tool, one round-trip via HF Inference Providers)
@@ -83,7 +83,7 @@ Roles overlap on integration days — pair-program when blocked.
 - Baseline benchmark numbers in hand
 - Synthetic corpus has ≥ 3 cached scenarios (Backend Lead can now dev without GPU)
 - Schemas (`RunMetrics`, `WasteBudget`, etc.) frozen
-- `RunnerProtocol` + `FakeRunner` working end-to-end
+- `RunnerProtocol` + `MockRunner` working end-to-end
 - Backend can call Qwen with one tool via HF Inference Providers
 - UI renders a fake audit
 - 10 KB rules drafted
@@ -217,7 +217,7 @@ Eligible participants get **$100 in AMD Developer Cloud credits**. Public refere
 | Day-4 final dry runs + record video | 2–3 | Lock the demo |
 | **Total estimate** | **~12–17 hrs** | Well within $100 even at bare-metal rates |
 
-Backend Lead spends zero MI300X time after Day 1 — develops against synthetic corpus + `FakeRunner`.
+Backend Lead spends zero MI300X time after Day 1 — develops against synthetic corpus + `MockRunner`.
 
 ## Submission Checklist
 

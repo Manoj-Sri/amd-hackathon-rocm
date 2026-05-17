@@ -1,1 +1,1 @@
-"""GPU runner abstractions: real ROCm/MI300X runner + FakeRunner for laptop dev."""
+"""GPU runner abstractions: real ROCm/MI300X runner + MockRunner for laptop dev."""

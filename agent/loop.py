@@ -56,7 +56,7 @@ def _auto_compare(
 
     Tier 2 — patch but only one benchmark: ≥1 patch + 1 benchmark.
         Use the single benchmark as baseline. For the "after" side, run
-        FakeRunner on the patched config to get a deterministic projection.
+        MockRunner on the patched config to get a deterministic projection.
         Marks the report as projected so the demo is honest about it.
 
     Tier 3 — no patch ran but we have rules from query_rocm_kb + ≥1 benchmark.
@@ -81,18 +81,18 @@ def _auto_compare(
         return _call_compare_runs(latest_patch, before, after, " (auto-synthesized compare_runs)")
 
     # Tier 2: patch + 1 benchmark — fill in the patched-side metrics from
-    # FakeRunner so the demo still produces a Report with a clear note.
+    # MockRunner so the demo still produces a Report with a clear note.
     if patches and len(benchmarks) == 1:
         latest_patch = patches[-1]["result"]
         before = benchmarks[0]["result"]
-        # Project the patched run via FakeRunner. The synthetic corpus has
+        # Project the patched run via MockRunner. The synthetic corpus has
         # a `02_optimized` scenario the patched config typically matches.
         from agent.schemas import WorkloadConfig
-        from runner.protocol import FakeRunner
+        from runner.protocol import MockRunner
 
         try:
             patched_cfg = WorkloadConfig.model_validate(latest_patch["new_config"])
-            after_metrics = FakeRunner().run(patched_cfg, steps=before.get("steps", 50))
+            after_metrics = MockRunner().run(patched_cfg, steps=before.get("steps", 50))
             after = after_metrics.model_dump()
         except Exception:
             return None
@@ -100,7 +100,7 @@ def _auto_compare(
             latest_patch,
             before,
             after,
-            " (auto-synthesized; patched-side projected via FakeRunner)",
+            " (auto-synthesized; patched-side projected via MockRunner)",
         )
 
     return None

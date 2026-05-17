@@ -1,7 +1,7 @@
 """profile_run tool — short profiling pass (default 10 steps) returning RunMetrics.
 
 Delegates to `runner.protocol.LiveRunner`, which itself auto-falls-back to
-`FakeRunner` whenever the host can't actually run a live profile (no
+`MockRunner` whenever the host can't actually run a live profile (no
 rocprofv3, no amd-smi, no /dev/dri/renderD*, subprocess failure, parse
 error). On a laptop you'll always see `runner_kind="fake"` with a clear
 warning prepended to `RunMetrics.warnings`.
