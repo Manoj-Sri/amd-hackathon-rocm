@@ -1,26 +1,3 @@
----
-title: GPU Goblin
-emoji: 🧌
-colorFrom: red
-colorTo: red
-sdk: docker
-app_port: 7860
-pinned: false
-license: mit
-short_description: Qwen agent that hunts wasted compute on AMD MI300X.
-tags:
-  - amd
-  - amd-hackathon-2026
-  - mi300x
-  - rocm
-  - qwen
-  - vllm
-  - huggingface
-  - agent
-  - fine-tuning
-  - llm
----
-
 # GPU Goblin
 
 > An AI agent that hunts wasted compute on AMD MI300X. Powered by Qwen.
