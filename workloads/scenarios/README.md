@@ -25,6 +25,6 @@ python -m agent workloads/scenarios/train_qwen_long_context.py
 These are **AST-parseable, optionally executable**. Each one redirects on
 the same fix — `parse_config` only walks the AST, so even if the script
 doesn't actually train cleanly, the agent's audit still works. If you
-want rocprofv3 to capture real numbers (vs FakeRunner fallback), the
+want rocprofv3 to capture real numbers (vs MockRunner fallback), the
 scripts marked "executable: yes" below are runnable; the others rely on
-FakeRunner replay.
+MockRunner replay.

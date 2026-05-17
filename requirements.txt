@@ -2,7 +2,7 @@
 #
 # Shape: Streamlit UI + in-process agent loop, where the agent talks to Qwen
 # via HF Inference Providers. GPU-touching tools (profile_run, benchmark)
-# fall back to FakeRunner — no GPU on the Space, no torch needed.
+# fall back to MockRunner — no GPU on the Space, no torch needed.
 #
 # Notably ABSENT:
 #   * `sentence-transformers` / `torch` / `transformers`

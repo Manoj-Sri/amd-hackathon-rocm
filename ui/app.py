@@ -600,7 +600,7 @@ def main() -> None:
             st.caption(
                 f"🟢 Live mode: agent runs **{qwen_model}** in-process via Hugging "
                 "Face Inference Providers. GPU-touching tools (profile_run, "
-                "benchmark) use the FakeRunner with cached MI300X metrics — "
+                "benchmark) use the MockRunner with cached MI300X metrics — "
                 "this is the demo lane for the Hugging Face Space."
             )
         elif BACKEND_URL != DEFAULT_BACKEND or BACKEND_URL == DEFAULT_BACKEND:

@@ -1,6 +1,6 @@
 """benchmark tool — full benchmark (default 50 steps), version-tagged cached.
 
-Delegates to `runner.protocol.LiveRunner` (which auto-falls-back to FakeRunner
+Delegates to `runner.protocol.LiveRunner` (which auto-falls-back to MockRunner
 when the host has no GPU). Adds a content-addressed cache keyed on:
 
     sha256(canonical_config_json

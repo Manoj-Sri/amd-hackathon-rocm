@@ -8,7 +8,7 @@
 #   - data.pin_memory_false                        (pin_memory=False)
 #
 # Executable: not really — full FT of a 7B model OOMs on a single MI300X
-# without LoRA. AST parse is fine; rocprofv3 will fail and FakeRunner kicks in.
+# without LoRA. AST parse is fine; rocprofv3 will fail and MockRunner kicks in.
 
 import os
 import sys

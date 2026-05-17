@@ -3,16 +3,16 @@
 This is the testability fix from the brooks-audit (Warning #2): without this
 abstraction, every change to a tool that touches profiling required an
 MI300X cloud session. With it, Backend Lead develops on a laptop using
-FakeRunner; Day-3 swaps in the real runner for the canonical demo.
+MockRunner; Day-3 swaps in the real runner for the canonical demo.
 
 Real implementations subclass `Runner` and call into goblin_runner.sh.
-Tests and laptop dev use FakeRunner, which loads canned RunMetrics from
+Tests and laptop dev use MockRunner, which loads canned RunMetrics from
 workloads/synthetic/.
 
 `LiveRunner` is the production path: it shells out to `goblin_runner.sh`
 (which itself wraps rocprofv3 + torch.profiler), parses the resulting
 artefacts via `runner.profile_parser.parse`, and on ANY failure
-(missing tools, no GPU, subprocess error) falls back to FakeRunner so the
+(missing tools, no GPU, subprocess error) falls back to MockRunner so the
 demo still works on a laptop.
 """
 
@@ -63,7 +63,7 @@ def gpu_available() -> tuple[bool, str | None]:
       2. `amd-smi` is on PATH (HBM/power telemetry sampler).
       3. /dev/dri has at least one `renderD*` node (a real AMD GPU).
 
-    If any check fails we fall back to FakeRunner with a clear warning.
+    If any check fails we fall back to MockRunner with a clear warning.
     """
     if shutil.which("rocprofv3") is None:
         return False, "rocprofv3 not found on PATH"
@@ -75,11 +75,11 @@ def gpu_available() -> tuple[bool, str | None]:
 
 
 # ---------------------------------------------------------------------------
-# FakeRunner — loads canned RunMetrics from workloads/synthetic/.
+# MockRunner — loads canned RunMetrics from workloads/synthetic/.
 # ---------------------------------------------------------------------------
 
 
-class FakeRunner:
+class MockRunner:
     """Loads pre-recorded RunMetrics from workloads/synthetic/<scenario>/cached_metrics.json.
 
     The scenario is selected by matching `WorkloadConfig` fields against each
@@ -175,7 +175,7 @@ class FakeRunner:
                 precision_path=0.06,
                 kernel_shape=0.04,
             ),
-            warnings=["FakeRunner: no matching scenario, returning generic baseline."],
+            warnings=["MockRunner: no matching scenario, returning generic baseline."],
             runner_kind="fake",
         )
 
@@ -336,7 +336,7 @@ def _default_runner_timeout_seconds() -> int:
 class LiveRunner:
     """Real-MI300X path: shells out to goblin_runner.sh and parses artefacts.
 
-    Auto-falls-back to FakeRunner whenever the host can't actually run a live
+    Auto-falls-back to MockRunner whenever the host can't actually run a live
     profile (missing rocprofv3/amd-smi, no AMD GPU, subprocess error, or
     parser failure). The fallback path is the demo safety net.
 
@@ -348,7 +348,7 @@ class LiveRunner:
         runner_script: Path | str = _DEFAULT_RUNNER_SCRIPT,
         user_script: Path | str = _DEFAULT_USER_SCRIPT,
         timeout_seconds: int | None = None,
-        fake_fallback: FakeRunner | None = None,
+        fake_fallback: MockRunner | None = None,
     ) -> None:
         # `timeout_seconds=None` (the default) means "consult
         # GOBLIN_RUNNER_TIMEOUT_SECONDS, then fall back to 1800s (30 min)".
@@ -367,7 +367,7 @@ class LiveRunner:
             timeout_seconds if timeout_seconds is not None
             else _default_runner_timeout_seconds()
         )
-        self._fake = fake_fallback or FakeRunner()
+        self._fake = fake_fallback or MockRunner()
 
     # ------------------------------------------------------------------
 
@@ -377,7 +377,7 @@ class LiveRunner:
             return self._fallback(
                 config,
                 steps,
-                f"LiveRunner: GPU/profiler unavailable ({reason}); using FakeRunner.",
+                f"LiveRunner: GPU/profiler unavailable ({reason}); using MockRunner.",
             )
 
         # Sanity-check the runner script before spawning anything.
@@ -385,13 +385,13 @@ class LiveRunner:
             return self._fallback(
                 config,
                 steps,
-                f"LiveRunner: runner script not found at {self.runner_script}; using FakeRunner.",
+                f"LiveRunner: runner script not found at {self.runner_script}; using MockRunner.",
             )
         if not os.access(self.runner_script, os.X_OK):
             return self._fallback(
                 config,
                 steps,
-                f"LiveRunner: runner script {self.runner_script} not executable; using FakeRunner.",
+                f"LiveRunner: runner script {self.runner_script} not executable; using MockRunner.",
             )
 
         # Late import — only needed on the live path. Keeps laptop-only test
@@ -431,13 +431,13 @@ class LiveRunner:
                     config,
                     steps,
                     f"LiveRunner: goblin_runner.sh timed out after "
-                    f"{self.timeout_seconds}s; using FakeRunner.",
+                    f"{self.timeout_seconds}s; using MockRunner.",
                 )
             except OSError as exc:
                 return self._fallback(
                     config,
                     steps,
-                    f"LiveRunner: failed to spawn goblin_runner.sh ({exc}); using FakeRunner.",
+                    f"LiveRunner: failed to spawn goblin_runner.sh ({exc}); using MockRunner.",
                 )
 
             # The workload's success signal is "did it write a non-trivial
@@ -447,7 +447,7 @@ class LiveRunner:
             # rocprofv3's tool teardown crashes), goblin_runner.sh propagates
             # a non-zero exit code even though the real metrics are sitting
             # right there. Don't throw away real data — if the profile is
-            # present, parse it. Only fall back to FakeRunner when the
+            # present, parse it. Only fall back to MockRunner when the
             # workload itself didn't produce output.
             profile_path = out_dir / "torch_profile.json"
             profile_recoverable = (
@@ -464,7 +464,7 @@ class LiveRunner:
                     steps,
                     "LiveRunner: goblin_runner.sh exited with "
                     f"code {proc.returncode} and no torch_profile.json was "
-                    "produced; using FakeRunner. "
+                    "produced; using MockRunner. "
                     f"Failure logs archived at {archive_path}. "
                     f"stderr tail: {stderr_tail}. "
                     f"stdout tail: {stdout_tail}.",
@@ -494,7 +494,7 @@ class LiveRunner:
                     config,
                     steps,
                     f"LiveRunner: profile_parser.parse failed ({type(exc).__name__}: {exc}); "
-                    "using FakeRunner.",
+                    "using MockRunner.",
                 )
 
             metrics.runner_kind = "live"
@@ -530,7 +530,7 @@ def _default_runner() -> Runner:
     """Return the runner profile_run / benchmark should use by default.
 
     Always returns a `LiveRunner` — `LiveRunner.run` itself decides whether to
-    actually invoke the GPU pipeline or fall back to FakeRunner. Centralising
+    actually invoke the GPU pipeline or fall back to MockRunner. Centralising
     this here means the live-vs-fake decision lives in exactly one place.
     """
     return LiveRunner()

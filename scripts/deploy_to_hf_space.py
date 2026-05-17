@@ -26,7 +26,7 @@ Files uploaded (matches the Streamlit Space's runtime needs):
   * ui/__init__.py + ui/app.py                 — entry point (app_file)
   * agent/                                     — schemas, tools, backends, etc.
   * kb/rocm_rules.yaml + .embeddings_cache_*   — KB + pre-built embeddings
-  * runner/__init__.py + runner/protocol.py    — FakeRunner for offline replay
+  * runner/__init__.py + runner/protocol.py    — MockRunner for offline replay
   * workloads/synthetic/                       — cached metric scenarios
   * workloads/_runtime.py                      — argparse helper (referenced
                                                   by the train_qwen_lora.py
@@ -93,7 +93,7 @@ FILES_TO_UPLOAD: list[str] = [
     # --- KB ---
     "kb/__init__.py",
     "kb/rocm_rules.yaml",
-    # --- Runner (FakeRunner is what the Space actually uses) ---
+    # --- Runner (MockRunner is what the Space actually uses) ---
     "runner/__init__.py",
     "runner/protocol.py",
     # --- Synthetic corpus + sample workload + offline-replay fixture ---
